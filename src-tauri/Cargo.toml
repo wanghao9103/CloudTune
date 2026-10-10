@@ -1,0 +1,21 @@
+[package]
+name = "yunting"
+version = "0.1.2"
+edition = "2021"
+rust-version = "1.90"
+description = "NetEase Cloud Music desktop client for Linux"
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+dbus = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+base64 = "0.22"
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }

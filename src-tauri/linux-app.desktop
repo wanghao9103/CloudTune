@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=CloudTune
+Comment=网易云音乐 Linux 第三方客户端
+Exec=yunting
+Icon=io.yunting.desktop
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=Music;网易云;CloudTune;
+StartupWMClass=Yunting

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=CloudTune
+Comment=网易云音乐 Linux 第三方客户端
+Exec={{{exec}}}
+Icon={{{icon}}}
+Terminal=false
+Categories={{{categories}}}
+Keywords=Music;网易云;CloudTune;
+# Tauri generates this compatibility entry from productName. The visible entry
+# is io.yunting.desktop.desktop, matching the GTK application ID on Wayland.
+NoDisplay=true

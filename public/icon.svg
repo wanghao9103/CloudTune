@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">CloudTune</title>
+  <desc id="description">暖珊瑚色圆角方块上的白色云朵与音符</desc>
+  <defs>
+    <linearGradient id="tile" x1="58" y1="36" x2="446" y2="474" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f78b50"/>
+      <stop offset="0.55" stop-color="#f36b55"/>
+      <stop offset="1" stop-color="#dd4b71"/>
+    </linearGradient>
+    <linearGradient id="note" x1="222" y1="207" x2="304" y2="337" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e96341"/>
+      <stop offset="1" stop-color="#d94161"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#tile)"/>
+  <path d="M166 357h179c41 0 73-31 73-72 0-38-28-70-65-73-9-49-51-86-102-86-46 0-85 28-99 69-40 3-71 36-71 76 0 47 35 86 85 86Z" fill="#f6ffff"/>
+  <path d="M258 304V207" fill="none" stroke="url(#note)" stroke-width="18" stroke-linecap="round"/>
+  <path d="M258 207c24 1 39 13 47 34-17-10-31-12-47-10Z" fill="url(#note)"/>
+  <ellipse cx="236" cy="313" rx="27" ry="20" transform="rotate(-20 236 313)" fill="url(#note)"/>
+</svg>
