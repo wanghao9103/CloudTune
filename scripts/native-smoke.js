@@ -99,6 +99,45 @@
     await invoke("smoke_trace", { phase: "restored" });
     background.pause();
     background.removeAttribute("src"); background.load(); URL.revokeObjectURL(wavUrl);
+    // Exercise the application's controller as well as the engine. The PCM is
+    // deliberately all zero; actual nonzero output is checked by audio-output-probe.py.
+    const files = new DataTransfer();
+    files.items.add(new File([wav], "CloudTune 合成播放烟测.wav", { type: "audio/wav" }));
+    const input = document.querySelector('input[type="file"]');
+    input.files = files.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    [...document.querySelectorAll(".nav-item")].find(e => e.textContent.includes("本地音乐")).click();
+    const waitUntil = async predicate => {
+      for (let i = 0; i < 80; i++) {
+        if (predicate()) return;
+        await new Promise(r => setTimeout(r, 100));
+      }
+      throw new Error("应用播放器状态检查超时");
+    };
+    await waitUntil(() => document.querySelector(".song-row .row-number"));
+    document.querySelector(".song-row .row-number").click();
+    const progress = () => Number(document.querySelector('[aria-label="播放进度"]').value);
+    const playback = () => document.querySelector(".play-main").getAttribute("aria-label");
+    await waitUntil(() => progress() > 2 && playback() === "暂停");
+    const beforeRecovery = progress();
+    document.querySelector(".audio-recovery").click();
+    // DOM click runs in this same task; allow React to commit the recovery state
+    // before checking the old button's enabled/playing attributes.
+    await new Promise(r => setTimeout(r, 100));
+    await waitUntil(() => !document.querySelector(".audio-recovery").disabled && playback() === "暂停");
+    await new Promise(r => setTimeout(r, 150));
+    const afterRecovery = progress();
+    report.checks.applicationRecovery = afterRecovery >= beforeRecovery - 0.15 && afterRecovery < beforeRecovery + 2;
+    document.querySelector(".play-main").click();
+    await new Promise(r => setTimeout(r, 100));
+    await waitUntil(() => playback() === "播放");
+    const pausedPosition = progress();
+    document.querySelector(".audio-recovery").click();
+    await new Promise(r => setTimeout(r, 100));
+    await waitUntil(() => !document.querySelector(".audio-recovery").disabled);
+    await new Promise(r => setTimeout(r, 500));
+    report.applicationPlayback = { beforeRecovery, afterRecovery, pausedPosition, afterPausedRecovery: progress(), state: playback() };
+    report.checks.applicationPauseRespected = playback() === "播放" && Math.abs(progress() - pausedPosition) < 0.15;
     report.ok = Object.values(report.checks).every(Boolean);
   } catch (e) {
     report.error = String(e.message || e);

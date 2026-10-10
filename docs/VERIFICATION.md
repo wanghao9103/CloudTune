@@ -41,15 +41,28 @@ Dock 修复的构建与回归日志：`.local/cloudtune-icon-debug.log`、`.loca
 
 ## 交付物
 
-- 最新包 `deliverables/CloudTune_0.1.2_ubuntu26.04_amd64.deb`，约 8.17 MiB；0.1.0 / 0.1.1 保留作历史交付。
-- 包名 `cloud-tune`，版本 `0.1.2`，架构 `amd64`；桌面显示名 / 窗口名 CloudTune；内部应用标识 `io.yunting.desktop` 保持不变，以保留原有账号与设置。
-- 0.1.2 SHA256：`b378cc7d46682916c5e998cab2e304f4b3e3fd8d0b19d9b6066e2c0ae2311cc7`；历史版本摘要同时记录于 `deliverables/SHA256SUMS`。
+- 最新包 `deliverables/CloudTune_0.1.3_ubuntu26.04_amd64.deb`，约 8.17 MiB；0.1.0 / 0.1.1 / 0.1.2 保留作历史交付。
+- 包名 `cloud-tune`，版本 `0.1.3`，架构 `amd64`；桌面显示名 / 窗口名 CloudTune；内部应用标识 `io.yunting.desktop` 保持不变，以保留原有账号与设置。
+- 0.1.3 SHA256：`b538c290347c0d8a36169ac8a576f225a0e6015b2ef3d6460647129619962e20`；历史版本摘要同时记录于 `deliverables/SHA256SUMS`。
 - 无管理员权限的安装位置 `~/.local/share/yunting/yunting`；桌面入口 `~/.local/share/applications/io.yunting.desktop.desktop`。完整 `.deb` 系统安装尚未实际执行，已做依赖解析模拟。
+
+## 0.1.3 声音中断与播放恢复
+
+- 用户报告截图工具的提示音播放后，CloudTune 仍显示播放但没有声音。现场只读检查时，播放器 PipeWire 流与 USB 输出均 running、未静音、未 cork，左右声道 Link active，错误计数为 0；这些状态不能证明实际输出有声，尚未确认该触发条件的底层根因。
+- 新控制器分开记录播放意图与媒体状态，监听缓冲 / 停滞 / 意外暂停；有播放意图但时间持续 6 秒不推进时，最多进行两次自动恢复。正常时钟、普通切换窗口、主动暂停、切歌或恢复取消不会触发无限重载或旧曲复活。正在请求歌曲 URL 的状态单独记录，避免旧媒体事件使取消按钮失效。
+- 底部音量旁和设置 → 播放提供“恢复声音”，清空旧资源后重载同曲，保留进度、音量及静音状态；原本主动暂停时继续保持暂停。系统 MediaSession 的 play / pause 改为明确且幂等的动作。Audio 元素只在初始化时创建，不再每次 React 渲染都构造一个。
+- Node 14 项测试通过（播放器 11 项、接口 3 项）；TypeScript / Vite 构建通过。Chromium 真正导入合成 WAV 的 6 项检查通过：重复系统 play、手动恢复的进度 / 音量、暂停期间恢复、意外暂停恢复、稳定 Audio 实例数、等待 URL 时暂停并忽略迟到返回；无外部网络请求。
+- 原生 WebKit / Tauri smoke 通过，应用播放器恢复进度由 2.3 秒到 2.6 秒；主动暂停后再恢复保持 2.6 秒，按钮仍为播放。既有托盘、GTK 标识、隐藏音频、单实例、密钥环和缩放检查再次通过。此烟测的 PCM 为全零，仅证明状态和时钟，实际非零输出由下列独立探针验证。
+- `scripts/audio-output-probe.py` 建立私有 D-Bus、PipeWire、Pulse、WirePlumber 和软件 null sink，不连接硬件，也不采集真实用户音频。WebKitGTK 2.52.6 播放非零 440 Hz PCM，44.1 / 48 kHz × 一次 / 三次 camera-shutter 音效，4 场景均测到音效瞬态及结束后的音乐信号；该私有软件输出场景没有复现持续失声。完整矩阵对合成录音按首次非零输出重新分析，另一次 fresh quick 验证退出 0；私有进程已清理，用户默认音频输出未改变。
+- 本机证据：`.local/audio-interruption-system-state.json`、`.local/playback-ui-check-final.log` / `.local/playback-ui-check.json`、`.local/cloudtune-audio-native-final.log` / `.local/native-smoke.h0QAXp/report.json`、`.local/audio-output-probe-20261010-141911/report.json`、`.local/audio-output-probe-20261010-142132/report.json`。首轮原生检查因同任务 DOM click 后尚未等 React 提交而误读旧按钮；增加等待后完整重跑通过。私有音频初次固定测量窗覆盖冷启动静默的原报告保留，没有把未启动音频误当截图导致的失声。
+- 0.1.3 最终 release / Debian 包已生成并安装到当前用户，正式进程 active；源与安装二进制一致，包内仅有 Tauri 将 bundle 标记 UNK 改为 DEB 的 3 字节差异，归一化标记后内容一致，ldd 无缺失库。证据 `.local/cloudtune-audio-release-final.log`、`.local/cloudtune-audio-bundle.log`、`.local/cloudtune-audio-installed.json`。
+- 更新并重启 0.1.3 后，用户在自己的桌面重新播放歌曲并截图，明确反馈“截图后仍正常播放”。该现场回归通过；未采集用户音频，也未单独核实这次歌曲与输出设备信息。
+- 未覆盖：截图故障的底层根因、不同音源 / 输出设备与长时间重复截图的完整组合。时钟仍推进但输出无声时不会以时钟作为有声证据或盲目无限刷新，应使用手动恢复并进一步排查实际设备；此次用户回归通过不代表全部触发条件均已解决。
 
 ## 未覆盖与边界
 
 - 没有完成真实账号扫码授权、短信发送 / 验证、登录后的个人歌单 / 喜欢同步回归。相关功能已实现，仍需用户实际账号验证；额外风控取决于服务端。
-- Ubuntu 24.04 CI 只配置、未执行；其他发行版 / 架构没有实测。本机新 glibc 产物只能按 Ubuntu 26.04 的包交付。
+- [首次 Ubuntu 24.04 CI](https://github.com/wanghao9103/CloudTune/actions/runs/38028899951) 的测试、格式 / Clippy 检查和桌面打包成功；尚未在 Ubuntu 24.04 桌面实测，其他发行版 / 架构也没有实测。本机新 glibc 产物仍只能按 Ubuntu 26.04 的包交付。
 - 托盘原生菜单的显示和注册有证据；未对物理桌面逐一人工点击所有托盘播放操作。自动隐藏音频检验采用可控 PCM，长时间在线流媒体连续换曲未覆盖。
 - 早期应用菜单和托盘注册成功未证明 Dock 身份正确；用户截图暴露了缺少 GTK 应用 ID 的默认齿轮问题。此次已验证真实窗口属性、启动器 / 图标解析与正式应用总线注册，未取得修复后物理 Dock 的截图。
 - 浏览器预览缩放不会改变媒体查询的 CSS 视口，不能替代原生缩放的小窗口证明。另测等效 576×400 CSS 视口时，既有紧凑侧栏规则会隐藏歌单；该场景没有计作长歌单可达通过。新滚动条的鼠标 / 键盘细节在 Chromium 检查，原生 smoke 不包含物理鼠标逐项视觉验证。

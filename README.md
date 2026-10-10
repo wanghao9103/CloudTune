@@ -12,6 +12,7 @@
 - 在线推荐、新歌、分类歌单、排行榜、单曲 / 歌单搜索与分页。
 - 歌单完整歌曲 ID 列表分页加载，每页最多 100 首。
 - 播放 / 暂停、上下曲、进度、音量、列表 / 单曲循环、随机、播放队列。
+- 播放停滞时有限自动恢复；保留进度的“恢复声音”操作，主动暂停与切歌可取消恢复。
 - 歌词播放页、时间同步与点击歌词跳转；系统媒体键通过 Web MediaSession 接入，取决于 WebKit / 桌面支持。
 - 网易云 App 扫码登录、手机号短信验证码登录；个人歌单、喜欢列表与收藏操作；退出登录。
 - 使用 Linux Secret Service（例如 GNOME Keyring）保存登录 Cookie，前端不接收 Cookie / token，也不保存密码。
@@ -24,12 +25,12 @@
 
 ## 运行桌面版
 
-从 [GitHub Releases](https://github.com/wanghao9103/CloudTune/releases/latest) 下载桌面安装包。当前 **v0.1.2** 安装包针对 **Ubuntu 26.04 x86_64**，尚未验证 Ubuntu 24.04 兼容性。源码构建的安装包输出到 `src-tauri/target/release/bundle/deb/`；二进制安装包不纳入源码仓库。
+从 [GitHub Releases](https://github.com/wanghao9103/CloudTune/releases/latest) 下载桌面安装包。当前 **v0.1.3** 安装包针对 **Ubuntu 26.04 x86_64**，Ubuntu 24.04 CI 已构建通过，但未做该系统的桌面实测；此下载包仍限定 Ubuntu 26.04。源码构建的安装包输出到 `src-tauri/target/release/bundle/deb/`；二进制安装包不纳入源码仓库。
 
 在下载目录中安装：
 
 ```bash
-sudo apt install ./CloudTune_0.1.2_ubuntu26.04_amd64.deb
+sudo apt install ./CloudTune_0.1.3_ubuntu26.04_amd64.deb
 ```
 
 安装后从应用菜单打开「CloudTune」，或运行 `yunting`。请在已解锁的桌面登录会话中运行，以便访问 GNOME Keyring。密钥环不可用时仍能临时登录，但重启后不会保留；界面会明确提示，绝不降级到明文文件。
@@ -63,12 +64,13 @@ npm run tauri build
 
 原生集成烟测需要 Xvfb、D-Bus、GNOME Keyring，以及 debug 可执行文件、Python dbus / PyGObject：`npm run test:native`。烟测会在 1431 服务未运行时自动准备并清理开发服务。使用隔离的 D-Bus 与 XDG 目录与合成托盘宿主，检查关闭后隐藏、后台音频持续、单实例恢复、托盘菜单导出及 WebView 缩放；只访问公开音乐和未授权二维码，不发送短信、不登录真实账号。报告仅在 debug 构建中启用，release 完全排除。
 
-仓库提供 Ubuntu 24.04 CI 配置，但只有实际运行成功才能宣称该基线受支持。当前验证范围见 [验收记录](docs/VERIFICATION.md)。
+[首次 Ubuntu 24.04 CI](https://github.com/wanghao9103/CloudTune/actions/runs/38028899951) 的测试与桌面打包通过，尚未在 Ubuntu 24.04 桌面实测。当前验证范围见 [验收记录](docs/VERIFICATION.md)。
 
 ## 结构与接口
 
 - `src/App.tsx`：页面、登录、播放器和队列。
 - `src/api.ts`：类型转换，自动选择原生 IPC 或开发服务。
+- `src/playback.ts`：媒体状态、播放意图与取消代次、有限停滞恢复和同曲进度保留。
 - `src-tauri/src/desktop.rs`：托盘、关闭行为、单实例恢复、界面缩放。
 - `src-tauri/src/api.rs`：操作白名单、WEAPI AES-CBC / RSA、公用 HTTP 客户端、系统密钥环与会话代次。
 - `scripts/web-api.mjs`：仅用于开发预览的 Node 实现。会话只在服务进程内存中，接口拒绝跨站访问。

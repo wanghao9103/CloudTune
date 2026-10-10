@@ -11,3 +11,5 @@ src-tauri/gen/schemas/
 !.env.example
 tsconfig.tsbuildinfo
 .DS_Store
+__pycache__/
+*.py[cod]

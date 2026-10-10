@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { createPlaybackController, type PlaybackController } from "./playback";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import QRCode from "qrcode";
 import { invoke } from "@tauri-apps/api/core";
@@ -165,6 +166,7 @@ export default function App() {
   const [current, setCurrent] = useState<Track | null>(null);
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(false);
+  const [recovering, setRecovering] = useState(false);
   const [trial, setTrial] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -203,7 +205,10 @@ export default function App() {
   const [loginError, setLoginError] = useState("");
   const [smsCountdown, setSmsCountdown] = useState(0);
   const loginAttempt = useRef(0);
-  const audio = useRef(new Audio());
+  const [audio] = useState(() => ({ current: new Audio() }));
+  const playback = useRef<PlaybackController | null>(null);
+  const onTrackEnded = useRef<() => void>(() => {});
+  const sourceLoading = useRef(false);
   const playGeneration = useRef(0);
   const loadGeneration = useRef(0);
   const localUrls = useRef<string[]>([]);
@@ -359,9 +364,8 @@ export default function App() {
   const playTrack = useCallback(
     async (t: Track, source?: Track[]) => {
       const generation = ++playGeneration.current;
-      audio.current.pause();
-      audio.current.removeAttribute("src");
-      audio.current.load();
+      sourceLoading.current = true;
+      playback.current?.reset();
       setPlaying(false);
       setBuffering(true);
       setTrial(false);
@@ -387,12 +391,13 @@ export default function App() {
           }
         }
         if (generation !== playGeneration.current) return;
-        audio.current.src = url!;
-        await audio.current.play();
+        sourceLoading.current = false;
+        await playback.current?.playSource(url!);
         if (generation !== playGeneration.current) return;
         setHistory((h) => [t, ...h.filter((x) => x.id !== t.id)].slice(0, 100));
       } catch (e) {
         if (generation === playGeneration.current) {
+          sourceLoading.current = false;
           setBuffering(false);
           notify(e instanceof Error ? e.message : "播放失败，请重试。");
         }
@@ -400,23 +405,45 @@ export default function App() {
     },
     [notify, quality],
   );
-  const togglePlay = useCallback(() => {
+  const pausePlayback = useCallback(() => {
+    ++playGeneration.current;
+    sourceLoading.current = false;
+    playback.current?.pause();
+    setBuffering(false);
+  }, []);
+  const resumePlayback = useCallback(() => {
     if (buffering) return;
     if (!current) {
       if (newSongs[0]) void playTrack(newSongs[0], newSongs);
       else notify("先选一首喜欢的歌吧");
       return;
     }
-    if (audio.current.paused) {
-      if (!audio.current.getAttribute("src")) {
-        void playTrack(current);
-        return;
-      }
-      void audio.current
-        .play()
-        .catch(() => notify("播放失败，请重新选择歌曲。"));
-    } else audio.current.pause();
+    if (!audio.current.getAttribute("src")) {
+      void playTrack(current);
+      return;
+    }
+    void playback.current?.resume().catch(() => {});
   }, [buffering, current, newSongs, notify, playTrack]);
+  const togglePlay = useCallback(() => {
+    if (recovering || buffering || playing || !audio.current.paused)
+      pausePlayback();
+    else resumePlayback();
+  }, [recovering, buffering, playing, pausePlayback, resumePlayback]);
+  const recoverSound = useCallback(() => {
+    if (!current || !audio.current.getAttribute("src")) return;
+    const generation = playGeneration.current;
+    const controller = playback.current;
+    void controller
+      ?.recover()
+      .then(() => {
+        if (
+          generation === playGeneration.current &&
+          controller === playback.current
+        )
+          notify("已刷新声音，保留当前歌曲和进度。");
+      })
+      .catch(() => {});
+  }, [current, notify]);
   const nextTrack = useCallback(
     (direction = 1) => {
       if (!queue.length) return;
@@ -431,46 +458,31 @@ export default function App() {
     },
     [queue, current, mode, playTrack],
   );
+  onTrackEnded.current = () => {
+    if (mode === "one") {
+      playback.current?.seek(0);
+      void playback.current?.resume().catch(() => {});
+    } else nextTrack();
+  };
   useEffect(() => {
-    const a = audio.current;
-    const update = () => {
-      setPosition(a.currentTime);
-      if (Number.isFinite(a.duration)) setDuration(a.duration);
-    };
-    const started = () => {
-      setPlaying(true);
-      setBuffering(false);
-    };
-    const stopped = () => setPlaying(false);
-    const ready = () => setBuffering(false);
-    const error = () => {
-      setPlaying(false);
-      setBuffering(false);
-      notify("音频加载失败，请检查网络或文件格式后重试。");
-    };
-    const ended = () => {
-      if (mode === "one") {
-        a.currentTime = 0;
-        void a.play().catch(error);
-      } else nextTrack();
-    };
-    a.addEventListener("timeupdate", update);
-    a.addEventListener("loadedmetadata", update);
-    a.addEventListener("playing", started);
-    a.addEventListener("pause", stopped);
-    a.addEventListener("canplay", ready);
-    a.addEventListener("error", error);
-    a.addEventListener("ended", ended);
+    const controller = createPlaybackController(audio.current, {
+      onState: (state) => {
+        setPlaying(state.playing);
+        setBuffering(state.buffering || sourceLoading.current);
+        setRecovering(state.recovering);
+        setPosition(state.position);
+        if (Number.isFinite(state.duration) && state.duration > 0)
+          setDuration(state.duration);
+      },
+      onError: notify,
+      onEnded: () => onTrackEnded.current(),
+    });
+    playback.current = controller;
     return () => {
-      a.removeEventListener("timeupdate", update);
-      a.removeEventListener("loadedmetadata", update);
-      a.removeEventListener("playing", started);
-      a.removeEventListener("pause", stopped);
-      a.removeEventListener("canplay", ready);
-      a.removeEventListener("error", error);
-      a.removeEventListener("ended", ended);
+      controller.dispose();
+      if (playback.current === controller) playback.current = null;
     };
-  }, [mode, nextTrack, notify]);
+  }, [audio, notify]);
   const closeLogin = useCallback(() => {
     loginAttempt.current++;
     setLoginOpen(false);
@@ -559,10 +571,8 @@ export default function App() {
         artwork: current.cover ? [{ src: current.cover }] : [],
       });
       navigator.mediaSession.playbackState = playing ? "playing" : "paused";
-      navigator.mediaSession.setActionHandler("play", togglePlay);
-      navigator.mediaSession.setActionHandler("pause", () =>
-        audio.current.pause(),
-      );
+      navigator.mediaSession.setActionHandler("play", resumePlayback);
+      navigator.mediaSession.setActionHandler("pause", pausePlayback);
       navigator.mediaSession.setActionHandler("nexttrack", () => nextTrack());
       navigator.mediaSession.setActionHandler("previoustrack", () =>
         nextTrack(-1),
@@ -570,7 +580,7 @@ export default function App() {
     } catch {
       /* Unsupported WebKit media-session actions are optional. */
     }
-  }, [current, playing, togglePlay, nextTrack]);
+  }, [current, playing, resumePlayback, pausePlayback, nextTrack]);
   useEffect(() => {
     let canceled = false;
     setLyricLines([]);
@@ -1084,7 +1094,7 @@ export default function App() {
           </div>
         </nav>
         <div className="sidebar-footer">
-          <span className="platform-dot" /> Linux 桌面版 <span>0.1.2</span>
+          <span className="platform-dot" /> Linux 桌面版 <span>0.1.3</span>
         </div>
       </aside>
       <div className="workspace">
@@ -1735,6 +1745,23 @@ export default function App() {
                 </div>
                 <div className="setting-row">
                   <div>
+                    <strong>声音恢复</strong>
+                    <p>截图提示音或切换耳机后若没有声音，可保留当前进度恢复</p>
+                  </div>
+                  <button
+                    className="outline-button"
+                    disabled={
+                      !current ||
+                      recovering ||
+                      !audio.current.getAttribute("src")
+                    }
+                    onClick={recoverSound}
+                  >
+                    {recovering ? "正在恢复…" : "恢复声音"}
+                  </button>
+                </div>
+                <div className="setting-row">
+                  <div>
                     <strong>快捷键</strong>
                     <p>
                       空格：播放 / 暂停 · Ctrl + ← / →：上一首 / 下一首 ·
@@ -1773,7 +1800,7 @@ export default function App() {
                   <img src="/icon.svg" alt="" />
                 </span>
                 <h2>CloudTune</h2>
-                <span>0.1.2 · Tauri 2</span>
+                <span>0.1.3 · Tauri 2</span>
                 <p>
                   面向 Linux 的第三方桌面客户端，界面参考 Windows 3.x 版。
                   <br />
@@ -1900,8 +1927,14 @@ export default function App() {
             </button>
             <button
               className="play-main"
-              title={playing ? "暂停" : "播放"}
-              aria-label={playing ? "暂停" : "播放"}
+              title={
+                recovering
+                  ? "正在恢复声音，点击取消"
+                  : buffering || playing
+                    ? "暂停"
+                    : "播放"
+              }
+              aria-label={recovering || buffering || playing ? "暂停" : "播放"}
               onClick={togglePlay}
             >
               {buffering ? (
@@ -1944,14 +1977,24 @@ export default function App() {
                 } as React.CSSProperties
               }
               onChange={(e) => {
-                audio.current.currentTime = Number(e.target.value);
-                setPosition(Number(e.target.value));
+                playback.current?.seek(Number(e.target.value));
               }}
             />
             <span>{time(duration)}</span>
           </div>
         </div>
         <div className="player-right">
+          <button
+            className="icon audio-recovery"
+            title="恢复声音（保留当前歌曲和进度）"
+            aria-label="恢复声音"
+            disabled={
+              !current || recovering || !audio.current.getAttribute("src")
+            }
+            onClick={recoverSound}
+          >
+            <RefreshCw size={18} className={recovering ? "spin" : ""} />
+          </button>
           <button
             className="quality-label"
             title="音质设置"
@@ -2067,7 +2110,7 @@ export default function App() {
                     key={`${l.time}-${i}`}
                     onClick={() => {
                       if (audio.current.getAttribute("src"))
-                        audio.current.currentTime = l.time;
+                        playback.current?.seek(l.time);
                     }}
                   >
                     {l.text}
