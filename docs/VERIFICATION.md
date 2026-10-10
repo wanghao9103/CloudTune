@@ -41,9 +41,9 @@ Dock 修复的构建与回归日志：`.local/cloudtune-icon-debug.log`、`.loca
 
 ## 交付物
 
-- 最新包 `deliverables/CloudTune_0.1.3_ubuntu26.04_amd64.deb`，约 8.17 MiB；0.1.0 / 0.1.1 / 0.1.2 保留作历史交付。
-- 包名 `cloud-tune`，版本 `0.1.3`，架构 `amd64`；桌面显示名 / 窗口名 CloudTune；内部应用标识 `io.yunting.desktop` 保持不变，以保留原有账号与设置。
-- 0.1.3 SHA256：`b538c290347c0d8a36169ac8a576f225a0e6015b2ef3d6460647129619962e20`；历史版本摘要同时记录于 `deliverables/SHA256SUMS`。
+- 最新包 `deliverables/CloudTune_0.1.4_ubuntu26.04_amd64.deb`，约 8.16 MiB；0.1.0 / 0.1.1 / 0.1.2 / 0.1.3 保留作历史交付。
+- 包名 `cloud-tune`，版本 `0.1.4`，架构 `amd64`；桌面显示名 / 窗口名 CloudTune；内部应用标识 `io.yunting.desktop` 保持不变，以保留原有账号与设置。
+- 0.1.4 SHA256：`ceab9654ee767ed26c41fa379bf1274e51d67fadf8df9b64d2ad76e631a66d49`；历史版本摘要同时记录于 `deliverables/SHA256SUMS`。
 - 无管理员权限的安装位置 `~/.local/share/yunting/yunting`；桌面入口 `~/.local/share/applications/io.yunting.desktop.desktop`。完整 `.deb` 系统安装尚未实际执行，已做依赖解析模拟。
 
 ## 0.1.3 声音中断与播放恢复
@@ -58,6 +58,18 @@ Dock 修复的构建与回归日志：`.local/cloudtune-icon-debug.log`、`.loca
 - 0.1.3 最终 release / Debian 包已生成并安装到当前用户，正式进程 active；源与安装二进制一致，包内仅有 Tauri 将 bundle 标记 UNK 改为 DEB 的 3 字节差异，归一化标记后内容一致，ldd 无缺失库。证据 `.local/cloudtune-audio-release-final.log`、`.local/cloudtune-audio-bundle.log`、`.local/cloudtune-audio-installed.json`。
 - 更新并重启 0.1.3 后，用户在自己的桌面重新播放歌曲并截图，明确反馈“截图后仍正常播放”。该现场回归通过；未采集用户音频，也未单独核实这次歌曲与输出设备信息。
 - 未覆盖：截图故障的底层根因、不同音源 / 输出设备与长时间重复截图的完整组合。时钟仍推进但输出无声时不会以时钟作为有声证据或盲目无限刷新，应使用手动恢复并进一步排查实际设备；此次用户回归通过不代表全部触发条件均已解决。
+
+## 0.1.4：进度停滞与跳转超时补充
+
+- 用户在 0.1.3 继续反馈：某些歌曲约 2 分多钟停住，时间不再推进，但看起来仍在播放；未记下具体歌曲。此前“截图后仍正常播放”的人工结果保留，不能将它扩展为所有播放故障均已修复。
+- 确认控制器缺陷：`seeking=true` 时 watchdog 每秒重置进度计时；重复 `playing` 事件也会掩盖冻结的时钟；首次加载失败后第二次恢复取到了 `load()` 清零的位置。旧版失败用例与真实 WebKit HTTP Range 断流均复现了相应边界。
+- 修复后普通跳转只获得一次宽限；停滞超过 6 秒可进入有限恢复。在线曲目重新获取同一歌曲的授权地址，本地音频保持原 URL；多次恢复沿用最初位置。恢复必须等跳转结束且时间实际推进至少 0.025 秒才成功，各等待阶段均有超时，暂停、切歌和退出可取消。
+- 页面显示“正在缓冲 / 正在恢复播放 / 播放中断”，恢复失败后保持明确停止；正常缓存内跳转完成或时间恢复推进会清除缓冲，避免没有额外 `playing` 事件时错误保持加载状态。
+- Node 23 项通过（播放器 20、接口 3）；TypeScript / Vite 构建通过。Chromium 实际 App 的 7 项检查通过，包含在线恢复重新请求授权地址并保留时间；没有外部请求。Tauri / WebKit 原生 smoke 的恢复、暂停、后台音频、托盘、GTK 身份、单实例和缩放全部通过。
+- 隔离 WebKitGTK 2.52.6 + 私有软件音频输出：180 秒合成 WAV 跳至 135 秒，旧版在 Range 无数据时一直 seeking、不恢复；新版重新获取完整 Range 地址后从 135 秒继续到约 147 秒，真实推进前保持恢复状态。永久断流时两次尝试后约 37 秒明确失败并暂停，保留 135 秒，不再重复尝试。零硬件、无用户音频采集，真实默认音频目标未变。
+- 最终 release / Debian 包构建通过并安装到当前用户，正式进程 active，ldd 无缺失库；源与安装二进制一致，包内仅 Tauri UNK → DEB 标记的 3 字节差异，归一化后内容一致。所有 5 个历史交付物的 SHA256 检查通过。
+- 证据：`.local/stall-probe/summary-final.json`（控制器摘要与最终源码一致）、`.local/cloudtune-stall-ui-renewal-final.log` / `.local/playback-ui-check-0.1.4.json`、`.local/cloudtune-stall-native-verified.log` / `.local/native-smoke.1GShnL/report.json`、`.local/cloudtune-stall-release.log`、`.local/cloudtune-stall-bundle.log`、`.local/cloudtune-stall-installed.json`。首轮 UI / 原生启动因 Vite 监控大量 `.local` 文件而 EMFILE；忽略该目录、Rust target 与 deliverables 后完整重跑通过，未修改系统 inotify 限制。
+- 未覆盖：用户未提供的具体歌曲及其 CDN 响应、实际格式或权限根因；此修复验证了已复现的控制器缺陷。用户表示暂时没空测试，新版本的用户歌曲人工回归保持待验证。
 
 ## 未覆盖与边界
 

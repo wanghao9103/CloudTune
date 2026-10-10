@@ -50,6 +50,8 @@ export function createPlaybackController(
   let lastErrorGeneration = -1;
   let lastTime = audio.currentTime || 0;
   let lastProgressAt = now();
+  let seekStartedAt: number | null = null;
+  let refreshSource: (() => Promise<string>) | undefined;
   let pendingSeek: { generation: number; position: number } | null = null;
   let activeRecovery: Promise<void> | null = null;
   let startingGeneration: number | null = null;
@@ -87,6 +89,7 @@ export function createPlaybackController(
     activeRecovery = null;
     startingGeneration = null;
     pendingSeek = null;
+    seekStartedAt = null;
     recovering = false;
     return generation;
   };
@@ -179,12 +182,41 @@ export function createPlaybackController(
     markProgress();
     emit();
   };
-  const rebuild = (automatic: boolean): Promise<void> => {
+  const waitForProgress = async (token: number, position: number) => {
+    let cleanup: () => void = () => {};
+    const progress = new Promise<void>((resolve, reject) => {
+      const check = () => {
+        if (audio.error) reject(new Error("音频加载失败"));
+        else if (!audio.seeking && audio.currentTime - position >= 0.025)
+          resolve();
+      };
+      audio.addEventListener("timeupdate", check);
+      audio.addEventListener("seeked", check);
+      audio.addEventListener("error", check);
+      const timer = repeat(check, 100);
+      cleanup = () => {
+        stopRepeat(timer);
+        audio.removeEventListener("timeupdate", check);
+        audio.removeEventListener("seeked", check);
+        audio.removeEventListener("error", check);
+      };
+      check();
+    });
+    try {
+      await guard(progress, token);
+    } finally {
+      cleanup();
+    }
+  };
+  const rebuild = (
+    automatic: boolean,
+    restorePosition = audio.currentTime,
+  ): Promise<void> => {
     if (activeRecovery) return activeRecovery;
     const url = source();
     if (disposed || !url) return Promise.resolve();
     const shouldPlay = wantsPlay;
-    const position = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+    const position = Number.isFinite(restorePosition) ? restorePosition : 0;
     const volume = audio.volume;
     const muted = audio.muted;
     const token = invalidate();
@@ -193,24 +225,34 @@ export function createPlaybackController(
     mediaPlaying = false;
     buffering = shouldPlay;
     internalPause();
-    // Empty the old resource before reassigning it, so an identical URL also
-    // tears down the WebKit/GStreamer resource instead of merely resuming it.
-    audio.removeAttribute("src");
-    audio.load();
-    pendingSeek = { generation: token, position };
-    audio.src = url;
-    audio.load();
-    audio.volume = volume;
-    audio.muted = muted;
     markProgress();
     emit();
     const operation = (async () => {
       try {
+        const replacement = refreshSource
+          ? await guard(refreshSource(), token)
+          : url;
+        if (!current(token)) throw new PlaybackCanceled();
+        if (!replacement) throw new Error("这首歌暂时无法播放");
+        // Reload an authorized URL for the same track; local files keep their URL.
+        audio.removeAttribute("src");
+        audio.load();
+        pendingSeek = { generation: token, position };
+        audio.src = replacement;
+        audio.load();
+        audio.volume = volume;
+        audio.muted = muted;
         await waitForMetadata(token);
         if (!current(token)) throw new PlaybackCanceled();
         applySeek();
-        if (shouldPlay && wantsPlay) await start(token);
-        else internalPause();
+        if (shouldPlay && wantsPlay) {
+          const baseline = Number.isFinite(audio.duration)
+            ? Math.min(position, Math.max(0, audio.duration - 0.01))
+            : position;
+          await start(token);
+          // A resolved play promise alone can leave a stalled seek/stream frozen.
+          await waitForProgress(token, baseline);
+        } else internalPause();
         if (!current(token)) throw new PlaybackCanceled();
         recovering = false;
         buffering = false;
@@ -228,10 +270,11 @@ export function createPlaybackController(
   };
   const autoRecover = async () => {
     if (!wantsPlay || disposed || activeRecovery) return;
+    const position = audio.currentTime;
     while (wantsPlay && !disposed && autoRecoveries < 2) {
       autoRecoveries++;
       try {
-        await rebuild(true);
+        await rebuild(true, position);
         return;
       } catch {
         if (!wantsPlay || disposed) return;
@@ -241,17 +284,16 @@ export function createPlaybackController(
       fail(generation, "播放中断，自动恢复未成功，请点击“恢复声音”重试。");
   };
   const checkProgress = () => {
-    if (!wantsPlay || disposed || recovering || !source() || audio.ended)
-      return;
-    if (audio.seeking) {
-      markProgress();
+    if (!wantsPlay || disposed || recovering || !source()) return;
+    if (audio.ended) {
+      listeners.ended();
       return;
     }
     if (Math.abs(audio.currentTime - lastTime) >= 0.025) {
       markProgress();
       return;
     }
-    if (now() - lastProgressAt < 6000) return;
+    if (now() - Math.max(lastProgressAt, seekStartedAt ?? 0) < 6000) return;
     // A progressing clock is deliberately never treated as proof of audible output.
     void autoRecover();
   };
@@ -263,7 +305,6 @@ export function createPlaybackController(
       } else {
         mediaPlaying = true;
         buffering = false;
-        markProgress();
       }
       emit();
     },
@@ -306,12 +347,33 @@ export function createPlaybackController(
       emit();
     },
     timeupdate: () => {
-      if (Math.abs(audio.currentTime - lastTime) >= 0.025) markProgress();
+      if (Math.abs(audio.currentTime - lastTime) >= 0.025) {
+        markProgress();
+        if (
+          !recovering &&
+          wantsPlay &&
+          !audio.paused &&
+          !audio.seeking &&
+          audio.readyState >= 3
+        ) {
+          buffering = false;
+          mediaPlaying = true;
+        }
+      }
       emit();
     },
-    seeking: markProgress,
+    seeking: () => {
+      seekStartedAt ??= now();
+      if (wantsPlay) buffering = true;
+      emit();
+    },
     seeked: () => {
-      markProgress();
+      seekStartedAt = null;
+      if (Math.abs(audio.currentTime - lastTime) >= 0.025) markProgress();
+      if (!recovering && wantsPlay && !audio.paused && audio.readyState >= 3) {
+        buffering = false;
+        mediaPlaying = true;
+      }
       emit();
     },
     emptied: () => {
@@ -354,13 +416,14 @@ export function createPlaybackController(
       buffering = false;
       autoRecoveries = 0;
       pauseRecoveryUsed = false;
+      refreshSource = undefined;
       internalPause();
       audio.removeAttribute("src");
       audio.load();
       markProgress();
       emit();
     },
-    async playSource(url: string) {
+    async playSource(url: string, resolveSource?: () => Promise<string>) {
       if (disposed) return;
       const token = invalidate();
       wantsPlay = true;
@@ -368,6 +431,7 @@ export function createPlaybackController(
       buffering = true;
       autoRecoveries = 0;
       pauseRecoveryUsed = false;
+      refreshSource = resolveSource;
       internalPause();
       audio.src = url;
       audio.load();

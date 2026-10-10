@@ -167,6 +167,7 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  const [playbackError, setPlaybackError] = useState("");
   const [trial, setTrial] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -369,21 +370,26 @@ export default function App() {
       setPlaying(false);
       setBuffering(true);
       setTrial(false);
+      setPlaybackError("");
       setCurrent(t);
       setPosition(0);
       setDuration(t.duration);
       if (source) setQueue(source);
       try {
-        let url = t.localUrl;
-        if (!url) {
+        const requestSource = async () => {
           const r = await api("songUrl", {
             id: t.id,
             br: quality === "standard" ? 128000 : 320000,
           });
-          if (generation !== playGeneration.current) return;
           const data = r.data?.[0];
           if (!data?.url)
             throw Error("这首歌暂时无法播放，可能需要会员或受版权限制。");
+          return data;
+        };
+        let url = t.localUrl;
+        if (!url) {
+          const data = await requestSource();
+          if (generation !== playGeneration.current) return;
           url = https(data.url);
           if (data.freeTrialInfo) {
             setTrial(true);
@@ -392,14 +398,21 @@ export default function App() {
         }
         if (generation !== playGeneration.current) return;
         sourceLoading.current = false;
-        await playback.current?.playSource(url!);
+        await playback.current?.playSource(
+          url!,
+          t.localUrl
+            ? undefined
+            : async () => https((await requestSource()).url),
+        );
         if (generation !== playGeneration.current) return;
         setHistory((h) => [t, ...h.filter((x) => x.id !== t.id)].slice(0, 100));
       } catch (e) {
         if (generation === playGeneration.current) {
           sourceLoading.current = false;
           setBuffering(false);
-          notify(e instanceof Error ? e.message : "播放失败，请重试。");
+          const message = e instanceof Error ? e.message : "播放失败，请重试。";
+          setPlaybackError(message);
+          notify(message);
         }
       }
     },
@@ -468,13 +481,17 @@ export default function App() {
     const controller = createPlaybackController(audio.current, {
       onState: (state) => {
         setPlaying(state.playing);
+        if (state.playing) setPlaybackError("");
         setBuffering(state.buffering || sourceLoading.current);
         setRecovering(state.recovering);
         setPosition(state.position);
         if (Number.isFinite(state.duration) && state.duration > 0)
           setDuration(state.duration);
       },
-      onError: notify,
+      onError: (message) => {
+        setPlaybackError(message);
+        notify(message);
+      },
       onEnded: () => onTrackEnded.current(),
     });
     playback.current = controller;
@@ -1094,7 +1111,7 @@ export default function App() {
           </div>
         </nav>
         <div className="sidebar-footer">
-          <span className="platform-dot" /> Linux 桌面版 <span>0.1.3</span>
+          <span className="platform-dot" /> Linux 桌面版 <span>0.1.4</span>
         </div>
       </aside>
       <div className="workspace">
@@ -1800,7 +1817,7 @@ export default function App() {
                   <img src="/icon.svg" alt="" />
                 </span>
                 <h2>CloudTune</h2>
-                <span>0.1.3 · Tauri 2</span>
+                <span>0.1.4 · Tauri 2</span>
                 <p>
                   面向 Linux 的第三方桌面客户端，界面参考 Windows 3.x 版。
                   <br />
@@ -1876,8 +1893,19 @@ export default function App() {
               {current?.name || "听见你的热爱"}
               {trial && <small className="trial-tag">试听</small>}
             </button>
-            <span className="ellipsis">
-              {current?.artist || "选择一首音乐，开始聆听"}
+            <span
+              className="ellipsis"
+              role="status"
+              aria-live="polite"
+              title={playbackError || undefined}
+            >
+              {recovering
+                ? "正在恢复播放…"
+                : buffering
+                  ? "正在缓冲…"
+                  : playbackError
+                    ? "播放中断，点击恢复声音"
+                    : current?.artist || "选择一首音乐，开始聆听"}
             </span>
           </div>
           <button
@@ -1930,14 +1958,16 @@ export default function App() {
               title={
                 recovering
                   ? "正在恢复声音，点击取消"
-                  : buffering || playing
-                    ? "暂停"
-                    : "播放"
+                  : buffering
+                    ? "正在缓冲，点击取消"
+                    : playing
+                      ? "暂停"
+                      : "播放"
               }
               aria-label={recovering || buffering || playing ? "暂停" : "播放"}
               onClick={togglePlay}
             >
-              {buffering ? (
+              {buffering || recovering ? (
                 <LoaderCircle size={20} className="spin" />
               ) : playing ? (
                 <Pause size={20} fill="currentColor" />

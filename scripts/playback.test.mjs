@@ -2,6 +2,77 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createPlaybackController } from "../src/playback.ts";
 
+test("automatic recovery renews the same track URL and preserves the stalled position", async () => {
+  const f = setup();
+  let renewals = 0;
+  await f.controller.playSource(
+    "https://example.test/expired.mp3",
+    async () => {
+      renewals++;
+      return "https://example.test/renewed.mp3";
+    },
+  );
+  assert.equal(renewals, 0);
+  f.controller.seek(135);
+  await f.clock.advance(6000);
+  assert.equal(renewals, 1);
+  assert.equal(f.audio.src, "https://example.test/renewed.mp3");
+  assert.ok(f.audio.currentTime >= 135 && f.audio.currentTime < 135.2);
+  assert.equal(f.state().playing, true);
+  assert.deepEqual(f.errors, []);
+  f.controller.dispose();
+});
+
+test("pause and switching tracks invalidate a pending renewed URL", async () => {
+  for (const switchTrack of [false, true]) {
+    const f = setup();
+    const pending = deferred();
+    await f.controller.playSource(
+      "https://example.test/old.mp3",
+      () => pending.promise,
+    );
+    f.controller.seek(135);
+    const recovering = f.controller.recover();
+    await flush();
+    if (switchTrack)
+      await f.controller.playSource("https://example.test/new.mp3");
+    else f.controller.pause();
+    pending.resolve("https://example.test/late-old.mp3");
+    await recovering;
+    await flush();
+    assert.equal(
+      f.audio.src,
+      switchTrack
+        ? "https://example.test/new.mp3"
+        : "https://example.test/old.mp3",
+    );
+    assert.equal(f.audio.paused, !switchTrack);
+    assert.equal(f.state().recovering, false);
+    assert.deepEqual(f.errors, []);
+    f.controller.dispose();
+    assert.equal(f.clock.jobs.size, 0);
+  }
+});
+
+test("renewed URL requests time out and leave interrupted playback stopped", async () => {
+  const f = setup();
+  let renewals = 0;
+  await f.controller.playSource("https://example.test/song.mp3", () => {
+    renewals++;
+    return new Promise(() => {});
+  });
+  f.controller.seek(135);
+  await f.clock.advance(8000);
+  assert.equal(renewals, 2);
+  assert.equal(f.state().playing, false);
+  assert.equal(f.state().recovering, false);
+  assert.equal(f.state().buffering, false);
+  assert.equal(f.audio.paused, true);
+  assert.equal(f.errors.length, 1);
+  f.controller.dispose();
+  assert.equal(f.clock.jobs.size, 0);
+});
+
 const flush = async () => {
   for (let i = 0; i < 16; i++) await Promise.resolve();
 };
@@ -61,6 +132,7 @@ class Audio extends EventTarget {
   loadCalls = 0;
   pauseCalls = 0;
   autoMetadata = true;
+  advanceAfterRecoveryPlay = true;
   playPlans = [];
   fire(name) {
     this.dispatchEvent(new Event(name));
@@ -75,6 +147,7 @@ class Audio extends EventTarget {
     const serial = ++this.loadCalls;
     this.paused = true;
     this.ended = false;
+    this.seeking = false;
     this.currentTime = 0;
     this.duration = NaN;
     this.readyState = 0;
@@ -95,6 +168,12 @@ class Audio extends EventTarget {
       this.paused = false;
       this.ended = false;
       this.fire("playing");
+      // A rebuilt resource must demonstrate real clock progress. Keep initial
+      // playback frozen so watchdog tests control that transition explicitly.
+      if (this.loadCalls > 1 && this.advanceAfterRecoveryPlay) {
+        this.currentTime += 0.1;
+        this.fire("timeupdate");
+      }
     });
   }
   pause() {
@@ -222,7 +301,7 @@ test("rebuilding preserves position, volume and mute, and leaves a deliberate pa
   f.audio.volume = 0.31;
   f.audio.muted = true;
   await f.controller.recover();
-  assert.equal(f.audio.currentTime, 47.5);
+  assert.equal(f.audio.currentTime, 47.6);
   assert.equal(f.audio.volume, 0.31);
   assert.equal(f.audio.muted, true);
   assert.equal(f.state().playing, true);
@@ -230,7 +309,7 @@ test("rebuilding preserves position, volume and mute, and leaves a deliberate pa
   await flush();
   const playCalls = f.audio.playCalls;
   await f.controller.recover();
-  assert.equal(f.audio.currentTime, 47.5);
+  assert.equal(f.audio.currentTime, 47.6);
   assert.equal(f.audio.playCalls, playCalls);
   assert.equal(f.audio.paused, true);
   assert.equal(f.state().playing, false);
@@ -250,12 +329,126 @@ test("a playing clock, focus return and seek do not trigger audio reloads", asyn
   }
   assert.equal(f.audio.loadCalls, 1);
   f.audio.seeking = true;
-  await f.clock.advance(15000);
+  await f.clock.advance(2000);
   assert.equal(f.audio.loadCalls, 1);
   f.audio.seeking = false;
   f.controller.seek(70);
   await f.clock.advance(5000);
   assert.equal(f.audio.loadCalls, 1);
+  f.controller.dispose();
+});
+
+test("a cached seek completes without another playing or canplay event", async () => {
+  const f = setup();
+  await f.controller.playSource("https://example.test/song-a.mp3");
+  f.audio.seeking = true;
+  f.audio.fire("seeking");
+  assert.equal(f.state().buffering, true);
+  f.audio.currentTime = 40;
+  f.audio.seeking = false;
+  f.audio.fire("seeked");
+  assert.equal(f.state().buffering, false);
+  assert.equal(f.state().playing, true);
+  assert.equal(f.audio.loadCalls, 1);
+  f.controller.dispose();
+});
+
+test("real clock progress clears buffering without another playing event", async () => {
+  const f = setup();
+  await f.controller.playSource("https://example.test/song-a.mp3");
+  f.audio.fire("waiting");
+  assert.equal(f.state().buffering, true);
+  assert.equal(f.state().playing, false);
+  f.audio.fire("timeupdate");
+  assert.equal(f.state().buffering, true);
+  f.audio.seeking = true;
+  f.audio.currentTime = 40;
+  f.audio.fire("timeupdate");
+  assert.equal(f.state().buffering, true);
+  f.audio.seeking = false;
+  f.audio.currentTime += 0.1;
+  f.audio.fire("timeupdate");
+  assert.equal(f.state().buffering, false);
+  assert.equal(f.state().playing, true);
+  assert.equal(f.audio.loadCalls, 1);
+  f.controller.dispose();
+});
+
+test("a stuck native seek is bounded and does not suppress recovery forever", async () => {
+  const f = setup();
+  await f.controller.playSource("https://example.test/song-a.mp3");
+  f.controller.seek(42);
+  f.audio.seeking = true;
+  f.audio.fire("seeking");
+  await f.clock.advance(15000);
+  assert.ok(
+    f.audio.loadCalls > 1,
+    "seek state must not indefinitely reset the progress watchdog",
+  );
+  assert.ok(f.audio.currentTime >= 42 && f.audio.currentTime < 42.3);
+  assert.equal(f.audio.seeking, false);
+  f.controller.dispose();
+});
+
+test("repeated playing events cannot mask a clock that never advances", async () => {
+  const f = setup();
+  await f.controller.playSource("https://example.test/song-a.mp3");
+  f.controller.seek(31);
+  for (let i = 0; i < 8; i++) {
+    f.audio.fire("playing");
+    await f.clock.advance(1000);
+  }
+  assert.ok(
+    f.audio.loadCalls > 1,
+    "only an advancing clock may reset progress timeout",
+  );
+  assert.equal(f.audio.currentTime, 31.1);
+  f.controller.dispose();
+});
+
+test("a failed metadata reload preserves the original position for the second recovery", async () => {
+  const f = setup();
+  await f.controller.playSource("https://example.test/song-a.mp3");
+  f.controller.seek(67.5);
+  f.audio.autoMetadata = false;
+  await f.clock.advance(6999);
+  assert.equal(f.audio.loadCalls, 3);
+  assert.equal(f.state().recovering, true);
+  f.audio.autoMetadata = true;
+  await f.clock.advance(1);
+  assert.equal(f.audio.loadCalls, 5);
+  assert.equal(
+    f.audio.currentTime,
+    67.6,
+    "the first load must not erase the second attempt's resume position",
+  );
+  assert.equal(f.state().recovering, false);
+  assert.equal(f.state().playing, true);
+  assert.deepEqual(f.errors, []);
+  f.controller.dispose();
+});
+
+test("a resolved native play promise without clock progress cannot report successful recovery", async () => {
+  const f = setup();
+  await f.controller.playSource("https://example.test/song-a.mp3");
+  f.controller.seek(55);
+  f.audio.advanceAfterRecoveryPlay = false;
+  const result = f.controller.recover().then(
+    () => ({ succeeded: true }),
+    (error) => ({ succeeded: false, error }),
+  );
+  await flush();
+  assert.equal(f.state().recovering, true);
+  assert.equal(f.state().playing, false);
+  await f.clock.advance(1000);
+  const settled = await result;
+  assert.equal(settled.succeeded, false);
+  assert.match(settled.error.message, /超时/);
+  assert.equal(f.audio.currentTime, 55);
+  assert.equal(f.state().recovering, false);
+  assert.equal(f.state().buffering, false);
+  assert.equal(f.state().playing, false);
+  assert.equal(f.errors.length, 1);
   f.controller.dispose();
 });
 
@@ -265,7 +458,7 @@ test("a six second media stall recovers at most twice, then reports a manual act
   f.controller.seek(22);
   await f.clock.advance(6000);
   assert.equal(f.audio.loadCalls, 3);
-  assert.equal(f.audio.currentTime, 22);
+  assert.equal(f.audio.currentTime, 22.1);
   await f.clock.advance(6000);
   assert.equal(f.audio.loadCalls, 5);
   await f.clock.advance(20000);
