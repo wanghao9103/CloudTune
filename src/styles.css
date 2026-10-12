@@ -1281,7 +1281,8 @@ img {
   width: 2px;
   background: var(--red);
   height: 100%;
-  animation: equalize 0.7s infinite alternate;
+  transform-origin: bottom;
+  animation: equalize 1.4s steps(4, end) infinite alternate;
 }
 .equalizer i:nth-child(2) {
   height: 50%;
@@ -1290,6 +1291,9 @@ img {
 .equalizer i:nth-child(3) {
   height: 75%;
   animation-delay: 0.5s;
+}
+.app-shell.lyrics-visible .equalizer i {
+  animation-play-state: paused;
 }
 .empty {
   display: flex;
@@ -1731,7 +1735,7 @@ input[type="range"]:focus::-webkit-slider-thumb {
   box-shadow:
     0 12px 45px #1c263327,
     0 0 0 7px #7f859512;
-  animation: spin 25s linear infinite;
+  animation: spin 25s steps(250, end) infinite;
   animation-play-state: paused;
 }
 .vinyl.rotating {
@@ -1973,8 +1977,14 @@ input[type="range"]:focus::-webkit-slider-thumb {
 }
 @keyframes equalize {
   to {
-    height: 30%;
+    transform: scaleY(0.3);
   }
+}
+
+:root[data-app-background="true"] *,
+:root[data-app-background="true"] *::before,
+:root[data-app-background="true"] *::after {
+  animation-play-state: paused !important;
 }
 @keyframes shimmer {
   to {

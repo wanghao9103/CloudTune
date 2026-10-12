@@ -13,6 +13,7 @@
 - 歌单完整歌曲 ID 列表分页加载，每页最多 100 首。
 - 播放 / 暂停、上下曲、进度、音量、列表 / 单曲循环、随机、播放队列。
 - 播放或跳转停滞时有限自动恢复，在线曲目重新请求授权地址；确认进度推进后才显示恢复成功。支持保留进度的“恢复声音”，主动暂停与切歌可取消恢复。
+- 播放进度独立更新，歌词按行同步；装饰动画低频刷新，窗口收起时暂停界面动画与进度重绘，后台播放和有限停滞恢复继续工作。
 - 歌词播放页、时间同步与点击歌词跳转；系统媒体键通过 Web MediaSession 接入，取决于 WebKit / 桌面支持。
 - 网易云 App 扫码登录、手机号短信验证码登录；个人歌单、喜欢列表与收藏操作；退出登录。
 - 使用 Linux Secret Service（例如 GNOME Keyring）保存登录 Cookie，前端不接收 Cookie / token，也不保存密码。
@@ -25,12 +26,12 @@
 
 ## 运行桌面版
 
-从 [GitHub Releases](https://github.com/wanghao9103/CloudTune/releases/latest) 下载桌面安装包。当前 **v0.1.4** 安装包针对 **Ubuntu 26.04 x86_64**，Ubuntu 24.04 CI 已构建通过，但未做该系统的桌面实测；此下载包仍限定 Ubuntu 26.04。源码构建的安装包输出到 `src-tauri/target/release/bundle/deb/`；二进制安装包不纳入源码仓库。
+从 [GitHub Releases](https://github.com/wanghao9103/CloudTune/releases/latest) 下载桌面安装包。当前 **v0.1.5** 安装包针对 **Ubuntu 26.04 x86_64**，既往版本的 Ubuntu 24.04 CI 已构建通过，但未做该系统的桌面实测；此下载包仍限定 Ubuntu 26.04。源码构建的安装包输出到 `src-tauri/target/release/bundle/deb/`；二进制安装包不纳入源码仓库。
 
 在下载目录中安装：
 
 ```bash
-sudo apt install ./CloudTune_0.1.4_ubuntu26.04_amd64.deb
+sudo apt install ./CloudTune_0.1.5_ubuntu26.04_amd64.deb
 ```
 
 安装后从应用菜单打开「CloudTune」，或运行 `yunting`。请在已解锁的桌面登录会话中运行，以便访问 GNOME Keyring。密钥环不可用时仍能临时登录，但重启后不会保留；界面会明确提示，绝不降级到明文文件。
@@ -70,6 +71,7 @@ npm run tauri build
 
 - `src/App.tsx`：页面、登录、播放器和队列。
 - `src/api.ts`：类型转换，自动选择原生 IPC 或开发服务。
+- `src/playback-view.ts` / `src/PlaybackProgress.tsx`：显示时钟与局部进度更新，不参与媒体恢复判断。
 - `src/playback.ts`：媒体状态、播放意图与取消代次、有限停滞恢复和同曲进度保留。
 - `src-tauri/src/desktop.rs`：托盘、关闭行为、单实例恢复、界面缩放。
 - `src-tauri/src/api.rs`：操作白名单、WEAPI AES-CBC / RSA、公用 HTTP 客户端、系统密钥环与会话代次。

@@ -1,6 +1,6 @@
 # CloudTune 本机验收记录
 
-日期：2026-10-10。状态：部分验证；已通过本机开发、原生和打包检查，真实账号授权与其他发行版未覆盖。
+日期：2026-10-12（含 2026-10-10 历史记录）。状态：部分验证；已通过本机开发、原生和打包检查，真实账号授权与其他发行版未覆盖。
 
 ## 环境
 
@@ -41,9 +41,9 @@ Dock 修复的构建与回归日志：`.local/cloudtune-icon-debug.log`、`.loca
 
 ## 交付物
 
-- 最新包 `deliverables/CloudTune_0.1.4_ubuntu26.04_amd64.deb`，约 8.16 MiB；0.1.0 / 0.1.1 / 0.1.2 / 0.1.3 保留作历史交付。
-- 包名 `cloud-tune`，版本 `0.1.4`，架构 `amd64`；桌面显示名 / 窗口名 CloudTune；内部应用标识 `io.yunting.desktop` 保持不变，以保留原有账号与设置。
-- 0.1.4 SHA256：`ceab9654ee767ed26c41fa379bf1274e51d67fadf8df9b64d2ad76e631a66d49`；历史版本摘要同时记录于 `deliverables/SHA256SUMS`。
+- 最新包 `deliverables/CloudTune_0.1.5_ubuntu26.04_amd64.deb`，8,563,278 字节，约 8.17 MiB；0.1.0 至 0.1.4 保留作历史交付。
+- 包名 `cloud-tune`，版本 `0.1.5`，架构 `amd64`；桌面显示名 / 窗口名 CloudTune；内部应用标识 `io.yunting.desktop` 保持不变，以保留原有账号与设置。
+- 0.1.5 SHA256：`ee02b2d68454f939dc4a40864b21c512244288d811ed2c31857d850b3711694a`；历史版本摘要同时记录于 `deliverables/SHA256SUMS`。
 - 无管理员权限的安装位置 `~/.local/share/yunting/yunting`；桌面入口 `~/.local/share/applications/io.yunting.desktop.desktop`。完整 `.deb` 系统安装尚未实际执行，已做依赖解析模拟。
 
 ## 0.1.3 声音中断与播放恢复
@@ -70,6 +70,22 @@ Dock 修复的构建与回归日志：`.local/cloudtune-icon-debug.log`、`.loca
 - 最终 release / Debian 包构建通过并安装到当前用户，正式进程 active，ldd 无缺失库；源与安装二进制一致，包内仅 Tauri UNK → DEB 标记的 3 字节差异，归一化后内容一致。所有 5 个历史交付物的 SHA256 检查通过。
 - 证据：`.local/stall-probe/summary-final.json`（控制器摘要与最终源码一致）、`.local/cloudtune-stall-ui-renewal-final.log` / `.local/playback-ui-check-0.1.4.json`、`.local/cloudtune-stall-native-verified.log` / `.local/native-smoke.1GShnL/report.json`、`.local/cloudtune-stall-release.log`、`.local/cloudtune-stall-bundle.log`、`.local/cloudtune-stall-installed.json`。首轮 UI / 原生启动因 Vite 监控大量 `.local` 文件而 EMFILE；忽略该目录、Rust target 与 deliverables 后完整重跑通过，未修改系统 inotify 限制。
 - 未覆盖：用户未提供的具体歌曲及其 CDN 响应、实际格式或权限根因；此修复验证了已复现的控制器缺陷。用户表示暂时没空测试，新版本的用户歌曲人工回归保持待验证。
+
+## 0.1.5：首页与后台界面性能
+
+- 用户反馈首页或收起到托盘时 CPU 偏高。确认截图中的 WebKit 进程归属 CloudTune；10 秒只读采样得到主进程约 22.3%、WebKit 约 41.3%。CPU 的 100% 表示一个逻辑核，现场负载没有同步采集，不能直接与后续合成测试相减。
+- 进度移至独立显示 store / 组件；主界面歌词订阅只在行号变化时更新。隐藏窗口暂停显示通知与 CSS 装饰动画，重显补齐最新位置；真实媒体事件、自动恢复与托盘播放控制继续工作。设置只在初始化读取，喜欢列表按依赖缓存。等高器使用缩放和每 1.4 秒 4 步的低频动画，歌词唱片约 10 Hz 旋转；歌词页打开时暂停被覆盖的等高器。
+- `npm test` 26 项与 TypeScript / Vite 生产构建通过。新增 3 项检查覆盖快照引用、订阅清理、隐藏期间保留时间、重显单次通知、重复时间歌词与前后跳转；既有 20 项播放器及 3 项 API 测试再次通过，媒体控制器未修改。
+- 隔离原生生产基线：首页可见播放 12 秒出现 46 次 App 提交与 230 次设置读取；隐藏窗口后 `document.hidden=true`，仍有 48 次 App 提交与 240 次设置读取，真实音频时间推进 11.99 秒。稳态 native IPC 为 0。该基线确认周期性界面工作，但不把它当作已完成的 CPU 优化收益。
+- Chromium 生产界面 8 项回归通过：进度推进与稳定 Audio、拖动跳转、歌词前后跳转、收藏、队列删除、手动恢复、暂停后跳转 / 恢复、模拟隐藏与重显；无外部请求或页面错误。模拟隐藏只证明显示逻辑，原生可见性另行验证。版本角标随后改为从 package 元数据读取，TypeScript / Vite 再次通过。
+- 新前端与未改变的原生桌面代码再次通过 `test:native`：恢复时进度 2.3 → 2.5 秒，主动暂停后的恢复保持 2.6 秒；关闭隐藏、后台音频、托盘菜单 / 唯一托盘、单实例恢复、GTK ID、密钥环与缩放通过。这轮复用 0.1.4 debug 二进制加载当前 0.1.5 开发前端，不将它描述为重新编译的 0.1.5 原生 release；生产性能与最终安装包另有验证。证据 `.local/cloudtune-perf-native.log` / `.local/native-smoke.dBGiYM/report.json`。
+- 对比探针只使用私有 D-Bus / XDG / Xvfb、合成歌单和 180 秒零 PCM；不采集用户音频，不改用户音频路由。先隔离进度且改为连续 transform 后，首页 WebKit 只下降约 6%；同一生产二进制、同一持续播放的动画消融中，连续等高器 93.777%、低频等高器 12.167%、静态 4.667%，定位到装饰动画仍有显著绘制开销。选择低频动画保留播放标识的动态效果，最终全场景对比另行记录。
+- 测试过程保留失败证据：早期阶段文件事件丢失导致部分 CPU 样本缺失；旧候选末尾退出过快导致最后一个样本无 WebKit。最终探针使用 FIFO 与退出屏障，并要求每个样本存在 WebKit。UI 初次合成媒体服务未实现 Range，恢复后跳转错误；正确返回 206 / Content-Range 后重跑通过。不能把测试夹具问题当成播放器回归，也不能用缺失样本报告完整通过。
+- 最终生产副本的七阶段原生检查全部通过，CPU 样本均有存活的 WebKit 子进程。首页可见播放每 12 秒仍有 48 次进度组件提交，直接插入 App 函数入口的计数为 0，设置读取 / 稳态 API / IPC 均为 0；没有将“顶层 App 隔离”写成“前台所有 React 停止刷新”。实际隐藏时 `document.hidden=true`、12 秒音频时间推进 11.988 秒，界面位置保持 15.3 秒，React 提交和 DOM 变化均为 0，动画 paused；显示后音频约 30.247 秒、界面 30.0 秒继续播放。歌词页仅换行更新，暂停后真实时钟稳定。
+- 最终首页可见暂停 / 播放、首页隐藏播放 / 暂停、100 首列表播放、歌词播放、列表暂停的 WebKit CPU 分别为 0.750 / 13.247 / 1.917 / 1.334 / 10.919 / 27.750 / 0%；对应原生主进程为 0.083 / 2.249 / 0 / 0 / 2.750 / 2.833 / 0%。每阶段预热 2.5 秒、采样 12 秒，100% 表示一个逻辑核。低占用阶段的 0% 是采样分辨率结果，不是资源消耗恒为零。Xvfb 和用户 Wayland 绘制路径不同，数值仅代表这一合成负载。
+- 同轮旧 / 新核心配对 `baseline-05` → `final-02`：首页播放主进程 13.494 → 2.416%（下降约 82%），WebKit 92.210 → 13.830%（约 85%）；隐藏播放 WebKit 3.416 → 2.083%（约 39%），主进程均约 0.083%。两次最终测量首页 WebKit 13.247–13.830%，隐藏 1.917–2.083%；暂停阶段在采样噪声附近，不据此主张收益。配对报告是明确的三阶段范围，不冒充完整七阶段报告。
+- 正式 0.1.5 release / Debian 包构建通过，APT 模拟依赖解析通过，六个交付物 SHA256 检查通过。当前用户应用已更新并重启，正式进程 active；GTK 应用总线与单实例总线均归属新进程，当前 GNOME 注册唯一 CloudTune 托盘及控制菜单，应用入口和暖色图标实际解析通过。源与安装二进制一致，包内仅 Tauri UNK → DEB 标记有 3 字节差异，归一化后一致；ldd 无缺失运行库，也不依赖项目隔离 SDK 路径。安装核验探针初次未兼容 GNOME 的 service@path / 纯总线名格式及播放中的“暂停”标签，修正探针后通过，未改产品代码或用户播放状态。
+- 证据目录 `.local/perf-probe/`；现场采样 `user-process-baseline.json`、生产旧版行为 `baseline-03/js-report.json`、动画消融 `motion-ablation-01/report.json`、最终原生 `final-01/report.json` / `harness-dist/app-instrumentation.json`、配对 `baseline-05/report.json` / `final-02/report.json`、汇总 `comparison-final.json`、UI `ui-regression.json`、单测 `.local/cloudtune-perf-final-tests.log`；构建 / 打包 / 安装证据 `.local/cloudtune-perf-release.log`、`.local/cloudtune-perf-bundle.log`、`.local/cloudtune-perf-apt-simulation.log`、`.local/cloudtune-perf-installed.json`。最终未插桩产品 JS SHA256 为 `9a955233f26ff6bb16fd0b1a807dbb0af45c8166b63a3ed934e30cd8932d15e9`，计数只写入独立探针副本。
 
 ## 未覆盖与边界
 

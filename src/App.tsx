@@ -1,5 +1,15 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useSyncExternalStore,
+  useMemo,
+} from "react";
 import { createPlaybackController, type PlaybackController } from "./playback";
+import { createPlaybackViewStore, activeLyricIndex } from "./playback-view";
+import PlaybackProgress from "./PlaybackProgress";
+import { version as appVersion } from "../package.json";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import QRCode from "qrcode";
 import { invoke } from "@tauri-apps/api/core";
@@ -140,7 +150,7 @@ export default function App() {
     trayCreated: boolean;
     trayHost: boolean;
   } | null>(null);
-  const [theme, setTheme] = useState(readStore("theme", "light"));
+  const [theme, setTheme] = useState(() => readStore("theme", "light"));
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loginOpen, setLoginOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -169,19 +179,20 @@ export default function App() {
   const [recovering, setRecovering] = useState(false);
   const [playbackError, setPlaybackError] = useState("");
   const [trial, setTrial] = useState(false);
-  const [position, setPosition] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(readStore("volume", 0.7));
+  const [clock] = useState(createPlaybackViewStore);
+  const [volume, setVolume] = useState(() => readStore("volume", 0.7));
   const [mode, setMode] = useState<"list" | "one" | "shuffle">("list");
   const [queueOpen, setQueueOpen] = useState(false);
   const [lyricsOpen, setLyricsOpen] = useState(false);
-  const [favorites, setFavorites] = useState<Track[]>(
+  const [favorites, setFavorites] = useState<Track[]>(() =>
     readStore("favorites", []),
   );
   const [likedIds, setLikedIds] = useState<number[]>([]);
-  const [history, setHistory] = useState<Track[]>(readStore("history", []));
+  const [history, setHistory] = useState<Track[]>(() =>
+    readStore("history", []),
+  );
   const [localTracks, setLocalTracks] = useState<Track[]>([]);
-  const [quality, setQuality] = useState(readStore("quality", "exhigh"));
+  const [quality, setQuality] = useState(() => readStore("quality", "exhigh"));
   const [toast, setToast] = useState("");
   const [lyricLines, setLyricLines] = useState<
     { time: number; text: string }[]
@@ -298,6 +309,19 @@ export default function App() {
     saveStore("volume", volume);
   }, [volume]);
   useEffect(() => {
+    const updateVisibility = () => {
+      const visible = !document.hidden;
+      document.documentElement.dataset.appBackground = String(!visible);
+      clock.setVisible(visible);
+    };
+    updateVisibility();
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", updateVisibility);
+      delete document.documentElement.dataset.appBackground;
+    };
+  }, [clock]);
+  useEffect(() => {
     saveStore("quality", quality);
   }, [quality]);
   useEffect(() => {
@@ -372,8 +396,7 @@ export default function App() {
       setTrial(false);
       setPlaybackError("");
       setCurrent(t);
-      setPosition(0);
-      setDuration(t.duration);
+      clock.update(0, t.duration);
       if (source) setQueue(source);
       try {
         const requestSource = async () => {
@@ -416,7 +439,7 @@ export default function App() {
         }
       }
     },
-    [notify, quality],
+    [notify, quality, clock],
   );
   const pausePlayback = useCallback(() => {
     ++playGeneration.current;
@@ -484,9 +507,10 @@ export default function App() {
         if (state.playing) setPlaybackError("");
         setBuffering(state.buffering || sourceLoading.current);
         setRecovering(state.recovering);
-        setPosition(state.position);
-        if (Number.isFinite(state.duration) && state.duration > 0)
-          setDuration(state.duration);
+        clock.update(
+          state.position,
+          state.duration > 0 ? state.duration : undefined,
+        );
       },
       onError: (message) => {
         setPlaybackError(message);
@@ -499,7 +523,7 @@ export default function App() {
       controller.dispose();
       if (playback.current === controller) playback.current = null;
     };
-  }, [audio, notify]);
+  }, [audio, notify, clock]);
   const closeLogin = useCallback(() => {
     loginAttempt.current++;
     setLoginOpen(false);
@@ -634,7 +658,14 @@ export default function App() {
       canceled = true;
     };
   }, [current]);
-  const activeLyric = lyricLines.findLastIndex((l) => l.time <= position);
+  const getActiveLyric = useCallback(
+    () =>
+      lyricsOpen
+        ? activeLyricIndex(lyricLines, clock.getSnapshot().position)
+        : -1,
+    [clock, lyricLines, lyricsOpen],
+  );
+  const activeLyric = useSyncExternalStore(clock.subscribe, getActiveLyric);
   useEffect(() => {
     if (lyricsOpen)
       lyricRef.current
@@ -856,10 +887,13 @@ export default function App() {
     setLikedIds([]);
     setAccountOpen(false);
   };
+  const likedSet = useMemo(() => new Set(likedIds), [likedIds]);
+  const favoriteSet = useMemo(
+    () => new Set(favorites.map((t) => t.id)),
+    [favorites],
+  );
   const isLiked = (t: Track) =>
-    profile && !t.localUrl
-      ? likedIds.includes(t.id)
-      : favorites.some((x) => x.id === t.id);
+    profile && !t.localUrl ? likedSet.has(t.id) : favoriteSet.has(t.id);
   const toggleLike = async (t: Track) => {
     const liked = isLiked(t);
     if (profile && !t.localUrl) {
@@ -1056,7 +1090,7 @@ export default function App() {
     </button>
   );
   return (
-    <div className="app-shell">
+    <div className={`app-shell${lyricsOpen ? " lyrics-visible" : ""}`}>
       <aside className="sidebar">
         <button className="brand" onClick={() => navigate("home")}>
           <span className="brand-mark">
@@ -1111,7 +1145,8 @@ export default function App() {
           </div>
         </nav>
         <div className="sidebar-footer">
-          <span className="platform-dot" /> Linux 桌面版 <span>0.1.4</span>
+          <span className="platform-dot" /> Linux 桌面版{" "}
+          <span>{appVersion}</span>
         </div>
       </aside>
       <div className="workspace">
@@ -1817,7 +1852,7 @@ export default function App() {
                   <img src="/icon.svg" alt="" />
                 </span>
                 <h2>CloudTune</h2>
-                <span>0.1.4 · Tauri 2</span>
+                <span>{appVersion} · Tauri 2</span>
                 <p>
                   面向 Linux 的第三方桌面客户端，界面参考 Windows 3.x 版。
                   <br />
@@ -1991,27 +2026,11 @@ export default function App() {
               <span className="lyric-icon">词</span>
             </button>
           </div>
-          <div className="progress">
-            <span>{time(position)}</span>
-            <input
-              aria-label="播放进度"
-              type="range"
-              min="0"
-              max={duration || 1}
-              step="0.1"
-              value={Math.min(position, duration || 1)}
-              disabled={!current || !audio.current.getAttribute("src")}
-              style={
-                {
-                  "--progress": `${duration ? (position / duration) * 100 : 0}%`,
-                } as React.CSSProperties
-              }
-              onChange={(e) => {
-                playback.current?.seek(Number(e.target.value));
-              }}
-            />
-            <span>{time(duration)}</span>
-          </div>
+          <PlaybackProgress
+            clock={clock}
+            enabled={!!current && !!audio.current.getAttribute("src")}
+            onSeek={(position) => playback.current?.seek(position)}
+          />
         </div>
         <div className="player-right">
           <button
