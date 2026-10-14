@@ -764,6 +764,28 @@ img {
 .tall .playlist-art {
   aspect-ratio: 0.77;
 }
+.tall .playlist-art::before {
+  content: "";
+  position: absolute;
+  inset: -12px;
+  background-image: inherit;
+  background-position: center;
+  background-size: cover;
+  filter: blur(12px);
+}
+.tall .playlist-art > .cover {
+  position: relative;
+  align-items: flex-start;
+  background: transparent;
+}
+.tall .playlist-art > .cover img {
+  height: auto;
+  aspect-ratio: 1;
+  object-fit: contain;
+}
+.tall .playlist-card:hover .playlist-art > .cover {
+  transform: none;
+}
 .tall .play-count {
   display: none;
 }

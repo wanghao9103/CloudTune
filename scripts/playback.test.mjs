@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createPlaybackController } from "../src/playback.ts";
+import { createQueueFailurePolicy } from "../src/playback-queue.ts";
 
 test("automatic recovery renews the same track URL and preserves the stalled position", async () => {
   const f = setup();
@@ -210,6 +211,7 @@ function setup(extra = {}) {
     lifecycleTarget: lifecycle,
     visibilityTarget: visibility,
     recoveryTimeoutMs: 1000,
+    stallTimeoutMs: 6000,
     ...extra,
   });
   return {
@@ -224,6 +226,104 @@ function setup(extra = {}) {
     ended: () => ended,
   };
 }
+
+test("recovery shares one deadline across URL, metadata, play and clock progress", async () => {
+  for (const slowStage of ["play", "progress"]) {
+    const f = setup();
+    await f.controller.playSource(
+      "https://example.test/old.mp3",
+      () =>
+        new Promise((resolve) =>
+          f.clock.setTimeout(
+            () => resolve("https://example.test/new.mp3"),
+            400,
+          ),
+        ),
+    );
+    f.controller.seek(67.5);
+    f.audio.autoMetadata = false;
+    const load = f.audio.load.bind(f.audio);
+    f.audio.load = () => {
+      load();
+      if (f.audio.src)
+        f.clock.setTimeout(() => {
+          f.audio.readyState = 4;
+          f.audio.duration = 180;
+          f.audio.fire("loadedmetadata");
+        }, 400);
+    };
+    if (slowStage === "play") {
+      f.audio.playPlans.push(
+        () => new Promise((resolve) => f.clock.setTimeout(resolve, 400)),
+      );
+    } else f.audio.advanceAfterRecoveryPlay = false;
+    const result = assert.rejects(f.controller.recover(), /超时/);
+    await f.clock.advance(999);
+    assert.equal(f.state().recovering, true);
+    await f.clock.advance(1);
+    assert.equal(
+      f.state().recovering,
+      false,
+      `${slowStage} must use the remaining budget`,
+    );
+    await result;
+    await f.clock.advance(500);
+    assert.equal(
+      f.audio.paused,
+      true,
+      "late play completion must respect the failed recovery",
+    );
+    assert.equal(f.state().playing, false);
+    assert.equal(f.errors.length, 1);
+    f.controller.dispose();
+    assert.equal(f.clock.jobs.size, 0);
+  }
+});
+
+test("default stall recovery is bounded to three seconds detection plus two four second attempts", async () => {
+  let skipped = 0;
+  let renewals = 0;
+  const f = setup({
+    recoveryTimeoutMs: undefined,
+    stallTimeoutMs: undefined,
+    onUnavailable: () => skipped++,
+  });
+  await f.controller.playSource("https://example.test/song.mp3", () => {
+    renewals++;
+    return new Promise(() => {});
+  });
+  f.controller.seek(135);
+  await f.clock.advance(2999);
+  assert.equal(renewals, 0);
+  await f.clock.advance(1);
+  assert.equal(renewals, 1);
+  await f.clock.advance(3999);
+  assert.equal(renewals, 1);
+  await f.clock.advance(1);
+  assert.equal(renewals, 2);
+  await f.clock.advance(4000);
+  assert.equal(f.state().recovering, false);
+  assert.equal(skipped, 1);
+  assert.equal(f.audio.currentTime, 135);
+  f.controller.dispose();
+  assert.equal(f.clock.jobs.size, 0);
+});
+
+test("short buffering and normal progress do not spend the faster recovery budget", async () => {
+  const f = setup({ stallTimeoutMs: undefined });
+  await f.controller.playSource("https://example.test/song.mp3");
+  for (let i = 0; i < 5; i++) {
+    f.audio.fire("waiting");
+    await f.clock.advance(2900);
+    f.audio.currentTime += 1;
+    f.audio.fire("timeupdate");
+    assert.equal(f.state().playing, true);
+    assert.equal(f.state().recovering, false);
+  }
+  assert.equal(f.audio.loadCalls, 1);
+  assert.deepEqual(f.errors, []);
+  f.controller.dispose();
+});
 
 test("resume is idempotent and buffering state follows media events", async () => {
   const f = setup();
@@ -452,7 +552,7 @@ test("a resolved native play promise without clock progress cannot report succes
   f.controller.dispose();
 });
 
-test("a six second media stall recovers at most twice, then reports a manual action", async () => {
+test("a six second media stall recovers at most twice, then reports unavailability", async () => {
   const f = setup();
   await f.controller.playSource("https://example.test/song-a.mp3");
   f.controller.seek(22);
@@ -467,7 +567,7 @@ test("a six second media stall recovers at most twice, then reports a manual act
   assert.equal(f.state().buffering, false);
   assert.equal(f.state().recovering, false);
   assert.equal(f.errors.length, 1);
-  assert.match(f.errors[0], /恢复声音/);
+  assert.match(f.errors[0], /自动恢复未成功/);
   f.controller.dispose();
 });
 
@@ -489,7 +589,7 @@ test("two failed automatic starts stop without selecting another track", async (
   f.controller.dispose();
 });
 
-test("an unsolicited pause recovers once; a user pause during recovery cancels it", async () => {
+test("unsolicited pauses share the two-retry budget; user pause cancels recovery", async () => {
   const f = setup();
   await f.controller.playSource("https://example.test/song-a.mp3");
   f.audio.interrupt();
@@ -498,7 +598,11 @@ test("an unsolicited pause recovers once; a user pause during recovery cancels i
   assert.equal(f.state().playing, true);
   f.audio.interrupt();
   await flush();
-  assert.equal(f.audio.loadCalls, 3);
+  assert.equal(f.audio.loadCalls, 5);
+  assert.equal(f.state().playing, true);
+  f.audio.interrupt();
+  await flush();
+  assert.equal(f.audio.loadCalls, 5);
   assert.equal(f.state().playing, false);
   assert.equal(f.errors.length, 1);
   f.controller.dispose();
@@ -518,6 +622,111 @@ test("an unsolicited pause recovers once; a user pause during recovery cancels i
   assert.equal(g.state().buffering, false);
   assert.deepEqual(g.errors, []);
   g.controller.dispose();
+});
+
+test("a media error automatically renews the URL before reporting failure", async () => {
+  const f = setup();
+  let renewals = 0;
+  await f.controller.playSource("https://example.test/old.mp3", async () => {
+    renewals++;
+    return "https://example.test/new.mp3";
+  });
+  f.controller.seek(42);
+  f.audio.fire("error");
+  await flush();
+  assert.equal(renewals, 1);
+  assert.equal(f.audio.src, "https://example.test/new.mp3");
+  assert.equal(f.audio.currentTime, 42.1);
+  assert.equal(f.state().playing, true);
+  assert.deepEqual(f.errors, []);
+  f.controller.dispose();
+});
+
+test("an initial native play rejection is recovered automatically", async () => {
+  const f = setup();
+  f.audio.playPlans.push(() => Promise.reject(new Error("decoder failed")));
+  await f.controller.playSource("https://example.test/song.mp3");
+  assert.equal(f.audio.playCalls, 2);
+  assert.equal(f.state().playing, true);
+  assert.deepEqual(f.errors, []);
+  f.controller.dispose();
+});
+
+test("autoplay permission rejection asks for a gesture without skipping the queue", async () => {
+  let skipped = 0;
+  const f = setup({ onUnavailable: () => skipped++ });
+  f.audio.playPlans.push(() =>
+    Promise.reject(new DOMException("gesture required", "NotAllowedError")),
+  );
+  await assert.rejects(
+    f.controller.playSource("https://example.test/song.mp3"),
+    /gesture/,
+  );
+  await f.clock.advance(30000);
+  assert.equal(skipped, 0);
+  assert.equal(f.audio.playCalls, 1);
+  assert.match(f.errors[0], /点击播放/);
+  f.controller.dispose();
+});
+
+test("exhausted recovery advances the queue once and ignores old asynchronous failures", async () => {
+  const queue = [{ id: 1 }, { id: 2 }, { id: 3 }];
+  const policy = createQueueFailurePolicy();
+  let currentId = 1;
+  const visited = [];
+  const f = setup({
+    onUnavailable: () => {
+      const next = policy.next(queue, currentId, false);
+      if (!next) return;
+      currentId = next.id;
+      visited.push(currentId);
+      void f.controller.playSource(`https://example.test/${currentId}.mp3`);
+    },
+  });
+  await f.controller.playSource("https://example.test/1.mp3", async () => {
+    throw new Error("offline");
+  });
+  f.audio.fire("error");
+  await flush();
+  assert.deepEqual(visited, [2]);
+  assert.equal(f.audio.src, "https://example.test/2.mp3");
+  assert.equal(f.state().playing, true);
+  assert.equal(f.ended(), 0);
+  f.controller.dispose();
+});
+
+test("canceling a failed recovery cannot trigger a late queue skip", async () => {
+  for (const action of ["pause", "reset", "dispose"]) {
+    let skipped = 0;
+    const pending = deferred();
+    const f = setup({ onUnavailable: () => skipped++ });
+    await f.controller.playSource(
+      "https://example.test/song.mp3",
+      () => pending.promise,
+    );
+    f.audio.fire("error");
+    await flush();
+    f.controller[action]();
+    pending.reject(new Error("late failure"));
+    await f.clock.advance(30000);
+    assert.equal(skipped, 0);
+    assert.deepEqual(f.errors, []);
+    f.controller.dispose();
+    assert.equal(f.clock.jobs.size, 0);
+  }
+});
+
+test("manual recovery of a paused song never invokes queue failure handling", async () => {
+  let skipped = 0;
+  const f = setup({ onUnavailable: () => skipped++ });
+  await f.controller.playSource("https://example.test/song.mp3", async () => {
+    throw new Error("offline");
+  });
+  f.controller.pause();
+  await assert.rejects(f.controller.recover(), /offline/);
+  assert.equal(skipped, 0);
+  assert.equal(f.audio.paused, true);
+  f.controller.dispose();
 });
 
 test("metadata recovery times out, and reset/dispose cancel in-flight work and timers", async () => {

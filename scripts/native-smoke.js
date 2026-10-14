@@ -3,6 +3,12 @@
   window.__cloudmusicSmokeStarted = true;
   const invoke = window.__TAURI_INTERNALS__.invoke;
   const report = { ok: false, checks: {} };
+  let lastAudio;
+  const nativePlay = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    lastAudio = this;
+    return nativePlay.call(this);
+  };
   try {
     const call = (action, params = {}) =>
       invoke("music_request", { action, params });
@@ -63,13 +69,47 @@
     report.zoomGeometry = { viewport: [innerWidth, innerHeight], doc: [document.documentElement.scrollWidth, document.documentElement.scrollHeight] };
     report.checks.zoom = innerWidth < report.geometry.viewport[0] && document.documentElement.scrollWidth === innerWidth && document.documentElement.scrollHeight === innerHeight;
     await invoke("set_ui_zoom", { scale: 1.0 });
-    const a = new Audio(u.data[0].url.replace(/^http:/, "https:"));
+    const cacheStarted = performance.now();
+    const cachedBytes = await invoke("prepare_audio", {
+      requestId: crypto.randomUUID(),
+      url: u.data[0].url.replace(/^http:/, "https:"),
+      expectedSize: u.data[0].freeTrialInfo ? 0 : u.data[0].size || 0,
+    });
+    const cachedMime = ({ mp3: "audio/mpeg", flac: "audio/flac", m4a: "audio/mp4", ogg: "audio/ogg", wav: "audio/wav" })[u.data[0].type] || "";
+    const cachedUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("测试缓存转换失败"));
+      reader.readAsDataURL(new Blob([cachedBytes], { type: cachedMime }));
+    });
+    report.checks.nativeAudioCache = cachedBytes instanceof ArrayBuffer && cachedBytes.byteLength > 0;
+    report.cachePreparationMs = Math.round(performance.now() - cacheStarted);
+    const a = new Audio(cachedUrl);
     a.volume = 0;
     await invoke("smoke_trace", { phase: "audio-start" });
     await Promise.race([a.play(), new Promise((_, reject) => setTimeout(() => reject(new Error("音频启动超时")), 15000))]);
     await invoke("smoke_trace", { phase: "audio-ready" });
     await new Promise((r) => setTimeout(r, 1600));
     report.checks.audio = a.currentTime > 0 && !a.paused;
+    if (window.__cloudmusicLongAudioSmoke) {
+      if (a.duration < 130) throw new Error("测试音源时长不足以覆盖两分钟连续播放");
+      const before = a.currentTime;
+      let last = before;
+      let frozenTicks = 0;
+      for (let i = 0; i < 125; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        frozenTicks = a.currentTime - last < 0.1 ? frozenTicks + 1 : 0;
+        if (a.paused || frozenTicks >= 3) throw new Error("本地缓存连续播放停滞");
+        last = a.currentTime;
+      }
+      report.cachedContinuousPlayback = { before, after: a.currentTime };
+      report.checks.cachedContinuousPlayback = a.currentTime - before > 120;
+    }
+    const cachedSeek = Math.min(135, a.duration * 0.7);
+    a.currentTime = cachedSeek;
+    for (let i = 0; i < 60 && (a.seeking || a.currentTime < cachedSeek + 0.1); i++)
+      await new Promise(r => setTimeout(r, 100));
+    report.checks.cachedAudioSeek = !a.seeking && a.currentTime > cachedSeek + 0.05 && !a.paused;
     a.pause();
     a.removeAttribute("src");
     a.load();
@@ -138,9 +178,51 @@
     await new Promise(r => setTimeout(r, 500));
     report.applicationPlayback = { beforeRecovery, afterRecovery, pausedPosition, afterPausedRecovery: progress(), state: playback() };
     report.checks.applicationPauseRespected = playback() === "播放" && Math.abs(progress() - pausedPosition) < 0.15;
+    // A broken local resource must use bounded recovery and continue the queue.
+    const failedFiles = new DataTransfer();
+    for (const name of ["CloudTune 损坏音源一.wav", "CloudTune 损坏音源二.wav"])
+      failedFiles.items.add(new File(["invalid synthetic audio"], name, { type: "audio/wav" }));
+    failedFiles.items.add(new File([wav], "CloudTune 队列恢复成功.wav", { type: "audio/wav" }));
+    input.files = failedFiles.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitUntil(() => document.querySelectorAll(".song-row").length === 4);
+    document.querySelectorAll(".song-row .row-number")[1].click();
+    await waitUntil(() => document.querySelector(".now-info .text-button").textContent.includes("队列恢复成功") && progress() > 0.2 && playback() === "暂停");
+    report.checks.applicationQueueSkipsFailedFiles = true;
+    document.querySelector(".play-main").click();
+    // Exercise the real online App path, including IPC bytes -> inline audio, not only
+    // a standalone media element or synthetic frontend bridge. Keep it silent.
+    document.querySelector('button[title="静音"]')?.click();
+    await new Promise(r => setTimeout(r, 100));
+    [...document.querySelectorAll(".nav-item")].find(e => e.textContent === "推荐").click();
+    await waitUntil(() => [...document.querySelectorAll(".music-section")].some(e => e.querySelector("h2")?.textContent.includes("最新音乐") && e.querySelector(".song-title .text-button")));
+    const latest = [...document.querySelectorAll(".music-section")].find(e => e.querySelector("h2")?.textContent.includes("最新音乐"));
+    const publicName = latest.querySelector(".song-title .text-button").textContent;
+    latest.querySelector(".outline-button").click();
+    await waitUntil(() => document.querySelector(".now-info .text-button").textContent === publicName && progress() > 0.3 && playback() === "暂停");
+    report.checks.applicationOnlineBuffered = true;
+    const onlineSeek = Math.min(135, lastAudio.duration * 0.6);
+    lastAudio.currentTime = onlineSeek;
+    await waitUntil(() => !lastAudio.seeking && progress() > onlineSeek);
+    report.checks.applicationOnlineCachedSeek = true;
+    const beforeOnlineRecovery = progress();
+    document.querySelector(".audio-recovery").click();
+    await new Promise(r => setTimeout(r, 100));
+    await waitUntil(() => !document.querySelector(".audio-recovery").disabled && progress() > beforeOnlineRecovery && playback() === "暂停");
+    report.checks.applicationOnlineCachedRecovery = true;
+    document.querySelector(".play-main").click();
     report.ok = Object.values(report.checks).every(Boolean);
   } catch (e) {
     report.error = String(e.message || e);
+    if (lastAudio) report.failedMedia = {
+      position: lastAudio.currentTime, paused: lastAudio.paused,
+      seeking: lastAudio.seeking, readyState: lastAudio.readyState,
+      networkState: lastAudio.networkState, error: lastAudio.error?.code || 0,
+      sourceKind: lastAudio.src.startsWith("data:audio/") ? "inline" : lastAudio.src.startsWith("blob:") ? "blob" : "other",
+      buffered: [...Array(lastAudio.buffered.length)].map((_,i) => [lastAudio.buffered.start(i), lastAudio.buffered.end(i)]),
+      status: document.querySelector(".now-info [role=status]")?.textContent,
+    };
   }
+  HTMLMediaElement.prototype.play = nativePlay;
   await invoke("smoke_report", { report });
 })();

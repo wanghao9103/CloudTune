@@ -1,6 +1,6 @@
 [package]
 name = "yunting"
-version = "0.1.5"
+version = "0.1.10"
 edition = "2021"
 rust-version = "1.90"
 description = "NetEase Cloud Music desktop client for Linux"
@@ -8,6 +8,7 @@ description = "NetEase Cloud Music desktop client for Linux"
 tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
+tokio = { version = "1", features = ["sync", "macros"] }
 tauri-plugin-single-instance = "2"
 dbus = "0.9"
 serde = { version = "1", features = ["derive"] }

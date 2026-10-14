@@ -6,10 +6,13 @@ export type PlaybackSnapshot = {
   duration: number;
 };
 
+export const PLAYBACK_TIMEOUT_MS = 4000;
+
 export type PlaybackOptions = {
   onState: (state: PlaybackSnapshot) => void;
   onError: (message: string) => void;
   onEnded: () => void;
+  onUnavailable?: (message: string) => void;
   now?: () => number;
   setInterval?: (callback: () => void, delay: number) => unknown;
   clearInterval?: (handle: unknown) => void;
@@ -17,6 +20,7 @@ export type PlaybackOptions = {
   clearTimeout?: (handle: unknown) => void;
   watchdogIntervalMs?: number;
   recoveryTimeoutMs?: number;
+  stallTimeoutMs?: number;
   lifecycleTarget?: EventTarget;
   visibilityTarget?: EventTarget;
 };
@@ -37,7 +41,8 @@ export function createPlaybackController(
     options.setTimeout ?? ((fn, delay) => globalThis.setTimeout(fn, delay));
   const stopLater =
     options.clearTimeout ?? ((id) => globalThis.clearTimeout(id as number));
-  const timeout = options.recoveryTimeoutMs ?? 12000;
+  const timeout = options.recoveryTimeoutMs ?? PLAYBACK_TIMEOUT_MS;
+  const stallTimeout = options.stallTimeoutMs ?? 3000;
   let generation = 0;
   let disposed = false;
   let wantsPlay = false;
@@ -46,7 +51,6 @@ export function createPlaybackController(
   let recovering = false;
   let expectedPauseEvents = 0;
   let autoRecoveries = 0;
-  let pauseRecoveryUsed = false;
   let lastErrorGeneration = -1;
   let lastTime = audio.currentTime || 0;
   let lastProgressAt = now();
@@ -93,7 +97,7 @@ export function createPlaybackController(
     recovering = false;
     return generation;
   };
-  const fail = (token: number, message: string) => {
+  const fail = (token: number, message: string, unavailable = false) => {
     if (!current(token) || lastErrorGeneration === token) return;
     lastErrorGeneration = token;
     wantsPlay = false;
@@ -103,8 +107,13 @@ export function createPlaybackController(
     internalPause();
     emit();
     options.onError(message);
+    if (unavailable && current(token)) options.onUnavailable?.(message);
   };
-  const guard = <T>(promise: Promise<T>, token: number): Promise<T> =>
+  const guard = <T>(
+    promise: Promise<T>,
+    token: number,
+    deadline = now() + timeout,
+  ): Promise<T> =>
     new Promise((resolve, reject) => {
       let complete = false;
       let timer: unknown;
@@ -118,7 +127,10 @@ export function createPlaybackController(
       };
       const cancel = () => finish(new PlaybackCanceled());
       cancellations.add(cancel);
-      timer = later(() => finish(new Error("音频启动超时")), timeout);
+      timer = later(
+        () => finish(new Error("音频启动超时")),
+        Math.max(0, deadline - now()),
+      );
       promise.then(
         (value) => (current(token) ? finish(null, value) : cancel()),
         (error) => (current(token) ? finish(error) : cancel()),
@@ -143,7 +155,7 @@ export function createPlaybackController(
       // Metadata/canplay will retry when the media timeline becomes available.
     }
   };
-  const waitForMetadata = async (token: number) => {
+  const waitForMetadata = async (token: number, deadline: number) => {
     if (audio.readyState >= 1) return;
     let ready: () => void = () => {};
     let error: () => void = () => {};
@@ -154,13 +166,13 @@ export function createPlaybackController(
       audio.addEventListener("error", error);
     });
     try {
-      await guard(metadata, token);
+      await guard(metadata, token, deadline);
     } finally {
       audio.removeEventListener("loadedmetadata", ready);
       audio.removeEventListener("error", error);
     }
   };
-  const start = async (token: number) => {
+  const start = async (token: number, deadline = now() + timeout) => {
     if (!current(token) || !wantsPlay) throw new PlaybackCanceled();
     startingGeneration = token;
     const promise = audio.play();
@@ -172,7 +184,7 @@ export function createPlaybackController(
       () => {},
     );
     try {
-      await guard(promise, token);
+      await guard(promise, token, deadline);
     } finally {
       if (startingGeneration === token) startingGeneration = null;
     }
@@ -182,7 +194,11 @@ export function createPlaybackController(
     markProgress();
     emit();
   };
-  const waitForProgress = async (token: number, position: number) => {
+  const waitForProgress = async (
+    token: number,
+    position: number,
+    deadline: number,
+  ) => {
     let cleanup: () => void = () => {};
     const progress = new Promise<void>((resolve, reject) => {
       const check = () => {
@@ -203,7 +219,7 @@ export function createPlaybackController(
       check();
     });
     try {
-      await guard(progress, token);
+      await guard(progress, token, deadline);
     } finally {
       cleanup();
     }
@@ -220,6 +236,9 @@ export function createPlaybackController(
     const volume = audio.volume;
     const muted = audio.muted;
     const token = invalidate();
+    // URL renewal, loading, play and clock confirmation share a single budget.
+    // Giving each stage a fresh timeout made one recovery take tens of seconds.
+    const deadline = now() + timeout;
     wantsPlay = shouldPlay;
     recovering = true;
     mediaPlaying = false;
@@ -230,7 +249,7 @@ export function createPlaybackController(
     const operation = (async () => {
       try {
         const replacement = refreshSource
-          ? await guard(refreshSource(), token)
+          ? await guard(refreshSource(), token, deadline)
           : url;
         if (!current(token)) throw new PlaybackCanceled();
         if (!replacement) throw new Error("这首歌暂时无法播放");
@@ -242,16 +261,16 @@ export function createPlaybackController(
         audio.load();
         audio.volume = volume;
         audio.muted = muted;
-        await waitForMetadata(token);
+        await waitForMetadata(token, deadline);
         if (!current(token)) throw new PlaybackCanceled();
         applySeek();
         if (shouldPlay && wantsPlay) {
           const baseline = Number.isFinite(audio.duration)
             ? Math.min(position, Math.max(0, audio.duration - 0.01))
             : position;
-          await start(token);
+          await start(token, deadline);
           // A resolved play promise alone can leave a stalled seek/stream frozen.
-          await waitForProgress(token, baseline);
+          await waitForProgress(token, baseline, deadline);
         } else internalPause();
         if (!current(token)) throw new PlaybackCanceled();
         recovering = false;
@@ -281,7 +300,7 @@ export function createPlaybackController(
       }
     }
     if (wantsPlay && !disposed)
-      fail(generation, "播放中断，自动恢复未成功，请点击“恢复声音”重试。");
+      fail(generation, "播放中断，自动恢复未成功。", true);
   };
   const checkProgress = () => {
     if (!wantsPlay || disposed || recovering || !source()) return;
@@ -293,7 +312,8 @@ export function createPlaybackController(
       markProgress();
       return;
     }
-    if (now() - Math.max(lastProgressAt, seekStartedAt ?? 0) < 6000) return;
+    if (now() - Math.max(lastProgressAt, seekStartedAt ?? 0) < stallTimeout)
+      return;
     // A progressing clock is deliberately never treated as proof of audible output.
     void autoRecover();
   };
@@ -317,11 +337,6 @@ export function createPlaybackController(
       emit();
       if (!wantsPlay || disposed || recovering || audio.ended || !source())
         return;
-      if (pauseRecoveryUsed) {
-        fail(generation, "播放再次中断，请点击“恢复声音”重试。");
-        return;
-      }
-      pauseRecoveryUsed = true;
       void autoRecover();
     },
     waiting: () => {
@@ -383,7 +398,8 @@ export function createPlaybackController(
     },
     error: () => {
       if (!source() || recovering) return;
-      fail(generation, "音频加载失败，请检查网络或文件格式后重试。");
+      if (wantsPlay) void autoRecover();
+      else fail(generation, "音频加载失败，请检查网络或文件格式后重试。");
     },
     ended: () => {
       if (!wantsPlay || !audio.ended || !source()) return;
@@ -415,7 +431,6 @@ export function createPlaybackController(
       mediaPlaying = false;
       buffering = false;
       autoRecoveries = 0;
-      pauseRecoveryUsed = false;
       refreshSource = undefined;
       internalPause();
       audio.removeAttribute("src");
@@ -430,7 +445,6 @@ export function createPlaybackController(
       mediaPlaying = false;
       buffering = true;
       autoRecoveries = 0;
-      pauseRecoveryUsed = false;
       refreshSource = resolveSource;
       internalPause();
       audio.src = url;
@@ -441,8 +455,11 @@ export function createPlaybackController(
         await start(token);
       } catch (error) {
         if (error instanceof PlaybackCanceled || !current(token)) return;
-        fail(token, "播放失败，请点击“恢复声音”或重新选择歌曲。");
-        throw error;
+        if (error instanceof Error && error.name === "NotAllowedError") {
+          fail(token, "请点击播放按钮以允许播放声音。");
+          throw error;
+        }
+        await autoRecover();
       }
     },
     async resume() {
@@ -455,7 +472,6 @@ export function createPlaybackController(
       const token = invalidate();
       wantsPlay = true;
       autoRecoveries = 0;
-      pauseRecoveryUsed = false;
       buffering = true;
       markProgress();
       emit();
@@ -463,8 +479,11 @@ export function createPlaybackController(
         await start(token);
       } catch (error) {
         if (error instanceof PlaybackCanceled || !current(token)) return;
-        fail(token, "播放失败，请点击“恢复声音”重试。");
-        throw error;
+        if (error instanceof Error && error.name === "NotAllowedError") {
+          fail(token, "请点击播放按钮以允许播放声音。");
+          throw error;
+        }
+        await autoRecover();
       }
     },
     pause() {
@@ -478,7 +497,6 @@ export function createPlaybackController(
     },
     recover() {
       autoRecoveries = 0;
-      pauseRecoveryUsed = false;
       return rebuild(false);
     },
     seek(seconds: number) {

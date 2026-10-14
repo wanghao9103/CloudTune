@@ -1,3 +1,4 @@
+import { createCachedAudioSource } from "./audio-source";
 import {
   useState,
   useEffect,
@@ -6,9 +7,14 @@ import {
   useSyncExternalStore,
   useMemo,
 } from "react";
-import { createPlaybackController, type PlaybackController } from "./playback";
+import {
+  createPlaybackController,
+  PLAYBACK_TIMEOUT_MS,
+  type PlaybackController,
+} from "./playback";
 import { createPlaybackViewStore, activeLyricIndex } from "./playback-view";
 import PlaybackProgress from "./PlaybackProgress";
+import { createQueueFailurePolicy } from "./playback-queue";
 import { version as appVersion } from "../package.json";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import QRCode from "qrcode";
@@ -220,8 +226,81 @@ export default function App() {
   const [audio] = useState(() => ({ current: new Audio() }));
   const playback = useRef<PlaybackController | null>(null);
   const onTrackEnded = useRef<() => void>(() => {});
+  const onTrackUnavailable = useRef<(message: string) => void>(() => {});
+  const [queueFailures] = useState(createQueueFailurePolicy);
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const activeTrack = useRef<Track | null>(null);
   const sourceLoading = useRef(false);
+  const audioCacheRequest = useRef<string | null>(null);
+  const audioSourcePreparation = useRef<AbortController | null>(null);
+  const onlineAudioUrl = useRef<string | null>(null);
+  const releaseOnlineAudio = useCallback(() => {
+    if (onlineAudioUrl.current?.startsWith("blob:"))
+      URL.revokeObjectURL(onlineAudioUrl.current);
+    onlineAudioUrl.current = null;
+  }, []);
+  const cancelAudioCache = useCallback(() => {
+    audioSourcePreparation.current?.abort();
+    audioSourcePreparation.current = null;
+    const requestId = audioCacheRequest.current;
+    audioCacheRequest.current = null;
+    if (desktop && requestId)
+      void invoke("cancel_audio", { requestId }).catch(() => {});
+  }, []);
   const playGeneration = useRef(0);
+  const lastPlaybackEvent = useRef({
+    generation: -1,
+    phase: "",
+    startedAt: 0,
+    samples: 0,
+  });
+  const logPlayback = useCallback(
+    (phase: string) => {
+      if (!desktop) return;
+      const generation = playGeneration.current;
+      const last = lastPlaybackEvent.current;
+      if (last.generation === generation && last.phase === phase) {
+        // Bounded clock samples establish startup and sustained progress without
+        // logging every timeupdate or introducing another playback timer.
+        const sampleAt = [5000, 15000, 125000][last.samples];
+        if (
+          phase !== "playing" ||
+          sampleAt === undefined ||
+          performance.now() - last.startedAt < sampleAt
+        )
+          return;
+        last.samples++;
+      } else {
+        lastPlaybackEvent.current = {
+          generation,
+          phase,
+          startedAt: performance.now(),
+          samples: 0,
+        };
+      }
+      const media = audio.current;
+      const src = media.getAttribute("src") || "";
+      void invoke("playback_event", {
+        snapshot: {
+          phase,
+          sourceKind: !src
+            ? "none"
+            : src === onlineAudioUrl.current
+              ? "cached"
+              : src.startsWith("blob:")
+                ? "local"
+                : "remote",
+          position: Number.isFinite(media.currentTime) ? media.currentTime : 0,
+          readyState: media.readyState,
+          paused: media.paused,
+          seeking: media.seeking,
+          errorCode: media.error?.code || 0,
+        },
+      }).catch(() => {});
+    },
+    [audio],
+  );
   const loadGeneration = useRef(0);
   const localUrls = useRef<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -335,8 +414,10 @@ export default function App() {
   }, [history]);
   useEffect(
     () => () => {
+      cancelAudioCache();
       audio.current.pause();
       audio.current.removeAttribute("src");
+      releaseOnlineAudio();
       localUrls.current.forEach(URL.revokeObjectURL);
       if (toastTimer.current) clearTimeout(toastTimer.current);
     },
@@ -387,23 +468,45 @@ export default function App() {
     void refreshAccount();
   }, [loadHome, refreshAccount]);
   const playTrack = useCallback(
-    async (t: Track, source?: Track[]) => {
+    async (t: Track, source?: Track[], automatic = false) => {
+      if (!automatic) queueFailures.reset();
+      cancelAudioCache();
+      activeTrack.current = t;
       const generation = ++playGeneration.current;
       sourceLoading.current = true;
       playback.current?.reset();
+      releaseOnlineAudio();
       setPlaying(false);
       setBuffering(true);
       setTrial(false);
       setPlaybackError("");
       setCurrent(t);
       clock.update(0, t.duration);
-      if (source) setQueue(source);
+      if (source) {
+        queueRef.current = source;
+        setQueue(source);
+      }
       try {
+        logPlayback("requesting");
         const requestSource = async () => {
-          const r = await api("songUrl", {
-            id: t.id,
-            br: quality === "standard" ? 128000 : 320000,
-          });
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let r;
+          try {
+            r = await Promise.race([
+              api("songUrl", {
+                id: t.id,
+                br: quality === "standard" ? 128000 : 320000,
+              }),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error("获取播放地址超时。")),
+                  PLAYBACK_TIMEOUT_MS,
+                );
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
           const data = r.data?.[0];
           if (!data?.url)
             throw Error("这首歌暂时无法播放，可能需要会员或受版权限制。");
@@ -411,44 +514,127 @@ export default function App() {
         };
         let url = t.localUrl;
         if (!url) {
-          const data = await requestSource();
+          let data;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              data = await requestSource();
+              break;
+            } catch (error) {
+              if (generation !== playGeneration.current) return;
+              if (attempt === 1) throw error;
+            }
+          }
           if (generation !== playGeneration.current) return;
           url = https(data.url);
           if (data.freeTrialInfo) {
             setTrial(true);
             notify("当前为试听片段，完整播放需要对应的账号权限。");
           }
+          if (desktop) {
+            // Play a complete, session-only local copy. Remote stream reloads
+            // otherwise seek straight back into the same interrupted transfer.
+            const requestId = crypto.randomUUID();
+            audioCacheRequest.current = requestId;
+            const preparation = new AbortController();
+            audioSourcePreparation.current = preparation;
+            logPlayback("caching");
+            let preparationTimer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              // Bound the complete round trip, including delivery from Rust to
+              // the WebView. The native download timeout cannot bound IPC.
+              const mime =
+                (
+                  {
+                    mp3: "audio/mpeg",
+                    flac: "audio/flac",
+                    m4a: "audio/mp4",
+                    ogg: "audio/ogg",
+                    wav: "audio/wav",
+                  } as Record<string, string>
+                )[data.type] || "application/octet-stream";
+              url = await Promise.race([
+                invoke<ArrayBuffer>("prepare_audio", {
+                  requestId,
+                  url,
+                  expectedSize: data.freeTrialInfo ? 0 : data.size || 0,
+                }).then((bytes) => {
+                  if (!(bytes instanceof ArrayBuffer) || !bytes.byteLength)
+                    throw new Error("音频缓存未能读取，请重试。");
+                  // An inline source avoids WebKitGTK's failing Blob range
+                  // requests. It stays in memory and never enters track storage.
+                  return createCachedAudioSource(
+                    bytes,
+                    mime,
+                    preparation.signal,
+                  );
+                }),
+                new Promise<never>((_, reject) => {
+                  preparationTimer = setTimeout(() => {
+                    reject(new Error("准备播放超时，请重试。"));
+                    preparation.abort();
+                    void invoke("cancel_audio", { requestId }).catch(() => {});
+                  }, 15000);
+                }),
+              ]);
+              if (generation !== playGeneration.current) return;
+              logPlayback("ready");
+              onlineAudioUrl.current = url;
+            } finally {
+              clearTimeout(preparationTimer);
+              if (audioSourcePreparation.current === preparation)
+                audioSourcePreparation.current = null;
+              if (audioCacheRequest.current === requestId)
+                audioCacheRequest.current = null;
+            }
+          }
         }
         if (generation !== playGeneration.current) return;
         sourceLoading.current = false;
-        await playback.current?.playSource(
+        const controller = playback.current;
+        if (!controller) throw new Error("播放器尚未准备好，请重试。");
+        logPlayback("starting");
+        await controller.playSource(
           url!,
-          t.localUrl
+          t.localUrl || desktop
             ? undefined
             : async () => https((await requestSource()).url),
         );
-        if (generation !== playGeneration.current) return;
+        if (generation !== playGeneration.current || audio.current.paused)
+          return;
         setHistory((h) => [t, ...h.filter((x) => x.id !== t.id)].slice(0, 100));
       } catch (e) {
         if (generation === playGeneration.current) {
           sourceLoading.current = false;
           setBuffering(false);
           const message = e instanceof Error ? e.message : "播放失败，请重试。";
-          setPlaybackError(message);
-          notify(message);
+          if (e instanceof Error && e.name === "NotAllowedError") return;
+          logPlayback("failed");
+          onTrackUnavailable.current(message);
         }
       }
     },
-    [notify, quality, clock],
+    [
+      notify,
+      quality,
+      clock,
+      queueFailures,
+      audio,
+      cancelAudioCache,
+      releaseOnlineAudio,
+      logPlayback,
+    ],
   );
   const pausePlayback = useCallback(() => {
     ++playGeneration.current;
+    cancelAudioCache();
     sourceLoading.current = false;
     playback.current?.pause();
+    queueFailures.reset();
     setBuffering(false);
-  }, []);
+  }, [queueFailures, cancelAudioCache]);
   const resumePlayback = useCallback(() => {
     if (buffering) return;
+    queueFailures.reset();
     if (!current) {
       if (newSongs[0]) void playTrack(newSongs[0], newSongs);
       else notify("先选一首喜欢的歌吧");
@@ -459,7 +645,7 @@ export default function App() {
       return;
     }
     void playback.current?.resume().catch(() => {});
-  }, [buffering, current, newSongs, notify, playTrack]);
+  }, [buffering, current, newSongs, notify, playTrack, queueFailures]);
   const togglePlay = useCallback(() => {
     if (recovering || buffering || playing || !audio.current.paused)
       pausePlayback();
@@ -467,6 +653,7 @@ export default function App() {
   }, [recovering, buffering, playing, pausePlayback, resumePlayback]);
   const recoverSound = useCallback(() => {
     if (!current || !audio.current.getAttribute("src")) return;
+    queueFailures.reset();
     const generation = playGeneration.current;
     const controller = playback.current;
     void controller
@@ -479,7 +666,7 @@ export default function App() {
           notify("已刷新声音，保留当前歌曲和进度。");
       })
       .catch(() => {});
-  }, [current, notify]);
+  }, [current, notify, queueFailures]);
   const nextTrack = useCallback(
     (direction = 1) => {
       if (!queue.length) return;
@@ -495,14 +682,44 @@ export default function App() {
     [queue, current, mode, playTrack],
   );
   onTrackEnded.current = () => {
+    queueFailures.reset();
     if (mode === "one") {
       playback.current?.seek(0);
       void playback.current?.resume().catch(() => {});
     } else nextTrack();
   };
+  onTrackUnavailable.current = (message) => {
+    const failedTrack = activeTrack.current;
+    if (!failedTrack) return;
+    const next = queueFailures.next(
+      queueRef.current,
+      failedTrack.id,
+      mode === "shuffle",
+    );
+    if (next) {
+      notify(`“${failedTrack.name}”暂时无法播放，已跳过，继续播放下一首。`);
+      void playTrack(next, undefined, true);
+    } else {
+      const reason =
+        queueRef.current.length > 1
+          ? "播放列表中的歌曲均未能播放，请检查网络后重试。"
+          : message;
+      setPlaybackError(reason);
+      notify(reason);
+    }
+  };
   useEffect(() => {
     const controller = createPlaybackController(audio.current, {
       onState: (state) => {
+        logPlayback(
+          state.recovering
+            ? "recovering"
+            : state.buffering || sourceLoading.current
+              ? "buffering"
+              : state.playing
+                ? "playing"
+                : "paused",
+        );
         setPlaying(state.playing);
         if (state.playing) setPlaybackError("");
         setBuffering(state.buffering || sourceLoading.current);
@@ -516,6 +733,7 @@ export default function App() {
         setPlaybackError(message);
         notify(message);
       },
+      onUnavailable: (message) => onTrackUnavailable.current(message),
       onEnded: () => onTrackEnded.current(),
     });
     playback.current = controller;
@@ -523,7 +741,7 @@ export default function App() {
       controller.dispose();
       if (playback.current === controller) playback.current = null;
     };
-  }, [audio, notify, clock]);
+  }, [audio, notify, clock, logPlayback]);
   const closeLogin = useCallback(() => {
     loginAttempt.current++;
     setLoginOpen(false);
@@ -1019,7 +1237,14 @@ export default function App() {
           className="playlist-card"
           onClick={() => openPlaylist(p)}
         >
-          <div className="playlist-art">
+          <div
+            className="playlist-art"
+            style={
+              tall && p.cover
+                ? { backgroundImage: `url(${JSON.stringify(p.cover)})` }
+                : undefined
+            }
+          >
             <Cover src={p.cover} />
             <span className="play-count">
               <Headphones size={11} />
@@ -1939,7 +2164,7 @@ export default function App() {
                 : buffering
                   ? "正在缓冲…"
                   : playbackError
-                    ? "播放中断，点击恢复声音"
+                    ? "播放中断，可重试或切换歌曲"
                     : current?.artist || "选择一首音乐，开始聆听"}
             </span>
           </div>

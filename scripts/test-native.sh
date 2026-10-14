@@ -4,9 +4,9 @@ cd "$(dirname "$0")/.."
 source scripts/local-env.sh
 mkdir -p .local
 session_dir=$(mktemp -d "$PWD/.local/native-smoke.XXXXXX")
-mkdir -p "$session_dir/runtime" "$session_dir/data" "$session_dir/config"
+mkdir -p "$session_dir/runtime" "$session_dir/data" "$session_dir/config" "$session_dir/cache"
 chmod 700 "$session_dir/runtime"
-export XDG_RUNTIME_DIR="$session_dir/runtime" XDG_DATA_HOME="$session_dir/data" XDG_CONFIG_HOME="$session_dir/config"
+export XDG_RUNTIME_DIR="$session_dir/runtime" XDG_DATA_HOME="$session_dir/data" XDG_CONFIG_HOME="$session_dir/config" XDG_CACHE_HOME="$session_dir/cache"
 export CLOUDMUSIC_SMOKE_REPORT="$session_dir/report.json"
 export CLOUDMUSIC_TEST_BINARY="$PWD/src-tauri/target/debug/yunting"
 export GDK_BACKEND=x11
@@ -40,7 +40,9 @@ xvfb-run -a dbus-run-session -- bash -euo pipefail <<'NATIVE'
   "$CLOUDMUSIC_TEST_BINARY" >"$XDG_RUNTIME_DIR/app.log" 2>&1 &
   app=$!
   trap 'kill "$app" "$host" 2>/dev/null || true' EXIT
-  for _ in {1..60}; do
+  smoke_wait_seconds=60
+  if [[ "${CLOUDMUSIC_LONG_AUDIO_SMOKE:-}" == "1" ]]; then smoke_wait_seconds=210; fi
+  for ((i=0; i<smoke_wait_seconds; i++)); do
     if [[ -f "$CLOUDMUSIC_SMOKE_REPORT" ]]; then break; fi
     sleep 1
   done

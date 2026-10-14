@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod api;
+mod audio;
 mod desktop;
 #[tauri::command]
 async fn music_request(
@@ -84,11 +85,15 @@ fn main() {
             desktop::show(app)
         }))
         .manage(api::MusicState::new())
+        .manage(audio::AudioCache::new().expect("audio buffer client"))
         .setup(desktop::setup)
         .on_window_event(desktop::on_window_event);
     #[cfg(debug_assertions)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         music_request,
+        audio::prepare_audio,
+        audio::cancel_audio,
+        audio::playback_event,
         desktop::desktop_state,
         desktop::set_close_to_tray,
         desktop::sync_tray,
@@ -101,6 +106,9 @@ fn main() {
     #[cfg(not(debug_assertions))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         music_request,
+        audio::prepare_audio,
+        audio::cancel_audio,
+        audio::playback_event,
         desktop::desktop_state,
         desktop::set_close_to_tray,
         desktop::sync_tray,
@@ -111,6 +119,9 @@ fn main() {
         if payload.event() == tauri::webview::PageLoadEvent::Finished
             && std::env::var_os("CLOUDMUSIC_SMOKE_REPORT").is_some()
         {
+            if std::env::var("CLOUDMUSIC_LONG_AUDIO_SMOKE").as_deref() == Ok("1") {
+                let _ = window.eval("window.__cloudmusicLongAudioSmoke = true;");
+            }
             let _ = window.eval(include_str!("../../scripts/native-smoke.js"));
         }
     });
