@@ -1,6 +1,6 @@
 {
   "name": "yunting",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,7 +11,8 @@
     "test": "node --test scripts/*.test.mjs",
     "test:native": "bash scripts/test-native.sh",
     "format": "prettier --write src scripts/*.mjs vite.config.ts",
-    "test:audio-source": "node scripts/audio-source-ui.mjs"
+    "test:audio-source": "node scripts/audio-source-ui.mjs",
+    "test:daily-playback": "node scripts/daily-playback-ui.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",

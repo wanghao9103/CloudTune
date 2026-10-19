@@ -158,6 +158,19 @@ export default function App() {
   } | null>(null);
   const [theme, setTheme] = useState(() => readStore("theme", "light"));
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [accountReady, setAccountReady] = useState(false);
+  const [startupDaily, setStartupDaily] = useState(
+    () => readStore("startupDaily", true) === true,
+  );
+  const [dailyPending, setDailyPending] = useState(false);
+  const dailyRequest = useRef(0);
+  const dailyLoading = useRef(false);
+  const startupHandled = useRef(false);
+  const cancelDailyPlayback = useCallback(() => {
+    dailyRequest.current++;
+    dailyLoading.current = false;
+    setDailyPending(false);
+  }, []);
   const [loginOpen, setLoginOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [recommend, setRecommend] = useState<Playlist[]>([]);
@@ -404,6 +417,13 @@ export default function App() {
     saveStore("quality", quality);
   }, [quality]);
   useEffect(() => {
+    saveStore("startupDaily", startupDaily);
+  }, [startupDaily]);
+  useEffect(
+    () => () => cancelDailyPlayback(),
+    [profile?.userId, cancelDailyPlayback],
+  );
+  useEffect(() => {
     saveStore("favorites", favorites);
   }, [favorites]);
   useEffect(() => {
@@ -428,6 +448,7 @@ export default function App() {
       const r = await api("account");
       const p = r.profile;
       setProfile(p || null);
+      setAccountReady(true);
       if (p) {
         const [u, l] = await Promise.allSettled([
           api("userPlaylists", { uid: p.userId }),
@@ -439,6 +460,8 @@ export default function App() {
       }
     } catch {
       /* A guest can browse without signing in. */
+    } finally {
+      setAccountReady(true);
     }
   }, []);
   const loadHome = useCallback(async () => {
@@ -469,6 +492,8 @@ export default function App() {
   }, [loadHome, refreshAccount]);
   const playTrack = useCallback(
     async (t: Track, source?: Track[], automatic = false) => {
+      startupHandled.current = true;
+      cancelDailyPlayback();
       if (!automatic) queueFailures.reset();
       cancelAudioCache();
       activeTrack.current = t;
@@ -622,22 +647,78 @@ export default function App() {
       cancelAudioCache,
       releaseOnlineAudio,
       logPlayback,
+      cancelDailyPlayback,
     ],
   );
+  const playDaily = useCallback(
+    async (automatic = false) => {
+      startupHandled.current = true;
+      if (dailyLoading.current) return;
+      if (!accountReady) {
+        notify("正在确认登录状态，请稍后再试。");
+        return;
+      }
+      if (!profile) {
+        notify("登录网易云账号后，即可播放每日推荐。");
+        if (!automatic) setLoginOpen(true);
+        return;
+      }
+      const request = ++dailyRequest.current;
+      dailyLoading.current = true;
+      setDailyPending(true);
+      setPlaybackError("");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const r = await Promise.race([
+          api("daily"),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("获取每日推荐超时，请点击播放重试。")),
+              10000,
+            );
+          }),
+        ]);
+        if (request !== dailyRequest.current) return;
+        const songs = (r.data?.dailySongs || []).map(track) as Track[];
+        if (!songs.length)
+          throw new Error("每日推荐暂无歌曲，请稍后点击播放重试。");
+        void playTrack(songs[0], songs);
+      } catch (e) {
+        if (request !== dailyRequest.current) return;
+        const message =
+          e instanceof Error ? e.message : "每日推荐加载失败，请点击播放重试。";
+        setPlaybackError(message);
+        notify(message);
+      } finally {
+        clearTimeout(timer);
+        if (request === dailyRequest.current) {
+          dailyLoading.current = false;
+          setDailyPending(false);
+        }
+      }
+    },
+    [accountReady, profile, notify, playTrack],
+  );
+  useEffect(() => {
+    if (!desktop || !accountReady || startupHandled.current) return;
+    startupHandled.current = true;
+    if (startupDaily) void playDaily(true);
+  }, [accountReady, startupDaily, playDaily]);
   const pausePlayback = useCallback(() => {
+    startupHandled.current = true;
+    cancelDailyPlayback();
     ++playGeneration.current;
     cancelAudioCache();
     sourceLoading.current = false;
     playback.current?.pause();
     queueFailures.reset();
     setBuffering(false);
-  }, [queueFailures, cancelAudioCache]);
+  }, [queueFailures, cancelAudioCache, cancelDailyPlayback]);
   const resumePlayback = useCallback(() => {
     if (buffering) return;
     queueFailures.reset();
     if (!current) {
-      if (newSongs[0]) void playTrack(newSongs[0], newSongs);
-      else notify("先选一首喜欢的歌吧");
+      void playDaily();
       return;
     }
     if (!audio.current.getAttribute("src")) {
@@ -645,9 +726,15 @@ export default function App() {
       return;
     }
     void playback.current?.resume().catch(() => {});
-  }, [buffering, current, newSongs, notify, playTrack, queueFailures]);
+  }, [buffering, current, playDaily, playTrack, queueFailures]);
   const togglePlay = useCallback(() => {
-    if (recovering || buffering || playing || !audio.current.paused)
+    if (
+      dailyLoading.current ||
+      recovering ||
+      buffering ||
+      playing ||
+      !audio.current.paused
+    )
       pausePlayback();
     else resumePlayback();
   }, [recovering, buffering, playing, pausePlayback, resumePlayback]);
@@ -814,12 +901,22 @@ export default function App() {
     void invoke("sync_tray", {
       title: current ? `${current.name} — ${current.artist}` : "",
       playing,
-      ready: !buffering && (!!current || newSongs.length > 0),
+      ready:
+        !buffering &&
+        (dailyPending || !!current || (accountReady && !!profile)),
       canSkip: !buffering && queue.length > 0,
     }).catch(() => {
       /* Tray may be unavailable on some desktops. */
     });
-  }, [current, playing, buffering, newSongs.length, queue.length]);
+  }, [
+    current,
+    playing,
+    buffering,
+    dailyPending,
+    accountReady,
+    profile,
+    queue.length,
+  ]);
   useEffect(() => {
     if (!("mediaSession" in navigator) || !current) return;
     try {
@@ -1093,6 +1190,7 @@ export default function App() {
     }
   };
   const logout = async () => {
+    cancelDailyPlayback();
     try {
       await api("logout");
     } catch (e) {
@@ -2008,6 +2106,23 @@ export default function App() {
                 <h2>播放</h2>
                 <div className="setting-row">
                   <div>
+                    <strong>启动时播放每日推荐</strong>
+                    <p>
+                      重新打开软件并恢复登录后，自动从当天推荐的第一首开始播放
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    aria-label="启动时播放每日推荐"
+                    checked={startupDaily}
+                    onChange={(e) => {
+                      setStartupDaily(e.target.checked);
+                      if (!e.target.checked) cancelDailyPlayback();
+                    }}
+                  />
+                </div>
+                <div className="setting-row">
+                  <div>
                     <strong>在线音质</strong>
                     <p>对下一首歌曲生效，可用音质取决于账号与版权权限</p>
                   </div>
@@ -2159,13 +2274,17 @@ export default function App() {
               aria-live="polite"
               title={playbackError || undefined}
             >
-              {recovering
-                ? "正在恢复播放…"
-                : buffering
-                  ? "正在缓冲…"
-                  : playbackError
-                    ? "播放中断，可重试或切换歌曲"
-                    : current?.artist || "选择一首音乐，开始聆听"}
+              {dailyPending
+                ? "正在获取每日推荐…"
+                : recovering
+                  ? "正在恢复播放…"
+                  : buffering
+                    ? "正在缓冲…"
+                    : playbackError
+                      ? current
+                        ? "播放中断，可重试或切换歌曲"
+                        : "每日推荐未能加载，点击播放重试"
+                      : current?.artist || "选择一首音乐，开始聆听"}
             </span>
           </div>
           <button
@@ -2216,18 +2335,24 @@ export default function App() {
             <button
               className="play-main"
               title={
-                recovering
-                  ? "正在恢复声音，点击取消"
-                  : buffering
-                    ? "正在缓冲，点击取消"
-                    : playing
-                      ? "暂停"
-                      : "播放"
+                dailyPending
+                  ? "正在获取每日推荐，点击取消"
+                  : recovering
+                    ? "正在恢复声音，点击取消"
+                    : buffering
+                      ? "正在缓冲，点击取消"
+                      : playing
+                        ? "暂停"
+                        : "播放"
               }
-              aria-label={recovering || buffering || playing ? "暂停" : "播放"}
+              aria-label={
+                dailyPending || recovering || buffering || playing
+                  ? "暂停"
+                  : "播放"
+              }
               onClick={togglePlay}
             >
-              {buffering || recovering ? (
+              {dailyPending || buffering || recovering ? (
                 <LoaderCircle size={20} className="spin" />
               ) : playing ? (
                 <Pause size={20} fill="currentColor" />

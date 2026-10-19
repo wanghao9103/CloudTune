@@ -166,3 +166,13 @@ Dock 修复的构建与回归日志：`.local/cloudtune-icon-debug.log`、`.loca
 - 同一媒体元素内联源重复启动 30 次通过；实际 App 在线入口 15 次通过。实际媒体采样 1.393 → 192.765 秒，无媒体错误或恢复。隐藏窗口定时器降频使固定 126 次一秒回调超过 225 秒脚本截止，原报告 timeout=true 保留；不将整个原脚本记为通过。另跑原生控制检查：跳至 135 秒、暂停续播、恢复通过，CSP 违规 0。证据 .local/inline-source-native-verification.json 和 .local/production-audio-probe/{stress-data-same-30,app-inline-hidden-timer-timeout,app-inline-controls}.log。
 - 0.1.10 release / deb、APT 模拟、11 项摘要和安装核对通过，备份 .local/rollback-before-0.1.10。通过托盘退出旧进程后更新并重启，源 / 安装一致，包内仅预期 3 字节 bundle 标记差异；唯一托盘与 GTK / 单实例身份通过。deb SHA256 为 2f14499be8660db55916018deca6f52c6c4d6b34e0d20de289ccee19ec20d791。
 - 正式用户窗口已经开始播放，检查时托盘为“暂停”，未重复发送播放动作；实际阶段采样 5.301 → 15.108 → 125.288 秒，ready=4、paused=false、error=0。未采集用户 PCM，物理可听输出和长期稳定性待使用验证。内联源增加约三分之一字符串长度，未测试整夜循环 / 极限大文件内存；本地导入仍用原 Blob。未公开提交 / 发布本轮版本。
+
+## 2026-10-19 启动自动播放每日推荐（0.1.11）
+
+- 旧版每次新进程都将 `current` / `queue` 初始化为空；首次点击播放取首页 `newSongs[0]`，不是历史记录或每日推荐。改为桌面恢复账号后自动请求 `daily`，按服务顺序从第一首建立整批推荐队列。访客只提示登录，空列表、接口失败和 10 秒超时支持点击播放重试，不回退到新歌。浏览器预览不自动播放；首次手动播放同样使用每日推荐。
+- 设置 → 播放新增默认开启的「启动时播放每日推荐」，保存在本机。每个新进程只尝试一次；恢复已有托盘窗口不会重播，后续登录可点击播放。账号恢复不等待收藏 / 歌单请求。手动选歌、暂停、关闭开关、退出登录和组件清理都会失效正在等待的推荐响应，避免迟到结果覆盖用户操作。
+- Node 38 项、TypeScript / Vite 生产构建通过。新增 `npm run test:daily-playback` 的 11 项合成场景通过：自动首曲及下一首、开关持久化、手动默认、访客登录提示、失败 / 空列表 / 超时重试、取消 / 手动选歌 / 账号恢复迟到 / 关闭开关，以及播放权限拒绝后的手势续播。既有 `test:audio-source` 的 8 项回归通过；两组浏览器检查无页面异常、无外部请求。证据 `.local/daily-playback-ui.json`、`.local/audio-source-ui.json`。
+- WebKitGTK 2.52.6 + Xvfb 加载当前生产前端，以合成账号和静音 PCM 检查，无用户点击自动播放、只请求一次推荐、首曲顺序、下一首、内联音源及暂停共 6 项通过。证据 `.local/daily-playback-webkit.py`、`.local/daily-playback-webkit.json`、`.local/daily-playback-webkit-allow.log`。该夹具模拟 IPC，不是实际账号 / Rust 推荐接口端到端测试。最初的 Python WebView 使用默认网站自动播放策略，产生 NotAllowedError；核对本地 Wry 0.57.0 源码后设置与 Wry 默认一致的 WebsitePolicies autoplay=ALLOW，完整重跑通过。仅设置 media-playback-requires-user-gesture=false 不足以模拟 Tauri 的策略；失败证据保留。
+- 既有全量 `test:native` 本轮未通过：公开 API、缓存在线音源播放 / 跳转、密钥环、GTK 身份、托盘与缩放均通过，随后历史 Blob PCM 背景测试返回 NotSupportedError / 媒体错误 4。该场景沿用已记录的 Blob 范围加载问题，未在本次每日推荐功能中改动本地文件播放；未将整套烟测标为通过。日志 `.local/daily-playback-native.log`、`.local/native-smoke.8RVdZf/report.json`。
+- 0.1.11 release / deb 构建、APT 模拟解析及 12 个交付物摘要通过。包 `deliverables/CloudTune_0.1.11_ubuntu26.04_amd64.deb` SHA256 为 `d1cec76149a0b49fcaa468839b0730ac9febca14306c115c17bb44a5880ae0f4`；源与包内程序仅预期 3 字节 bundle 标记不同。备份 `.local/rollback-before-0.1.11/yunting`，通过实际托盘退出旧进程后更新当前用户安装并用现有桌面入口启动。安装与 release 一致，GTK / 单实例总线归属新进程、唯一托盘、桌面入口、无缺失库及无需 SDK 均通过；托盘显示正在播放。证据 `.local/daily-playback-installed.json`、`.local/daily-playback-check-installed.py`、release / bundle / apt-simulation 日志。
+- 边界：没有读取真实账号的推荐内容、检查真实歌单次序或验证物理有声输出；具体版权、会员和当天推荐结果仍由网易云服务决定。尚未创建 0.1.11 Release。
